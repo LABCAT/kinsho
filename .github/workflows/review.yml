@@ -158,6 +158,16 @@ jobs:
           fi
           echo "Kinsho: $KINSHO_REPOSITORY@$KINSHO_SHA"
 
+      # What the caller asked for, before anything can fail: an empty value means
+      # the variable is unset and the default applies once it is checked below.
+      - name: Log requested model and effort
+        env:
+          MODEL_INPUT: ${{ inputs.model }}
+          EFFORT_INPUT: ${{ inputs.effort }}
+        run: |
+          echo "Requested model: ${MODEL_INPUT:-<unset, default applies>}"
+          echo "Requested effort: ${EFFORT_INPUT:-<unset, default applies>}"
+
       # The verdict logic and the agent come from the Kinsho commit the caller
       # pinned, so neither the PR nor the caller's checkout supplies them.
       - name: Checkout Kinsho

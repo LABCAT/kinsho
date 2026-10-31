@@ -640,6 +640,12 @@ test('the model is checked before the review runs and before anything is posted'
   assert.ok(!WORKFLOW.includes('KINSHO_MODEL: ${{ inputs.model }}'));
 });
 
+test('the requested model and effort are logged before the secrets check can fail', () => {
+  const log = WORKFLOW.indexOf('Log requested model and effort');
+  assert.ok(log > 0);
+  assert.ok(log < WORKFLOW.indexOf('review-cli.mjs requireSecrets'));
+});
+
 test('the README caller snippet passes both repository variables', () => {
   assert.ok(README.includes('model: ${{ vars.KINSHO_MODEL }}'));
   assert.ok(README.includes('effort: ${{ vars.KINSHO_EFFORT }}'));
