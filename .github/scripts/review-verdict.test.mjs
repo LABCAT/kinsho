@@ -9,6 +9,8 @@ import { test } from 'node:test';
 
 import {
   ALL_REVIEW_LABELS,
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
   PR_READY_LABEL,
   REVIEW_AUTOMATION_FAILED_LABEL,
   REVIEW_BLOCKED_LABEL,
@@ -16,6 +18,7 @@ import {
   REVIEW_NEEDS_EVIDENCE_LABEL,
   REVIEWER_HEADER,
   automationFailureComment,
+  checkModelSettings,
   backoffDelayMs,
   buildReviewPrompt,
   classifyRun,
@@ -32,7 +35,9 @@ import {
   missingSecrets,
   normalizeVerdict,
   parseMeta,
+  parseModelCatalog,
   parseProtectedPaths,
+  resolveModelSettings,
   reviewerOwnedChanges,
   safetyBlockedBody,
   validateReview,
@@ -44,6 +49,7 @@ const HEAD = 'a'.repeat(40);
 const OTHER_HEAD = 'b'.repeat(40);
 const ROUTING_MARKER = '<!-- route-to-implementer -->';
 const WORKFLOW = readFileSync(new URL('../workflows/review.yml', import.meta.url), 'utf8');
+const README = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
 const AGENT = readFileSync(new URL('../../.opencode/agent/kinsho-review.md', import.meta.url), 'utf8');
 
 function reviewBody(verdict, head = HEAD) {
@@ -520,8 +526,121 @@ test('the reusable workflow runs its own pinned code, never the caller checkout'
   assert.ok(WORKFLOW.indexOf('Resolve Kinsho version') < WORKFLOW.indexOf('Checkout Kinsho'));
 });
 
-test('the default model input matches the agent file', () => {
-  const agentModel = AGENT.match(/^model: (.+)$/m)[1];
-  const defaultModel = WORKFLOW.match(/^ {6}model:\n(?: {8}.+\n)*? {8}default: (.+)$/m)[1];
-  assert.equal(defaultModel, agentModel);
+const CATALOG = parseModelCatalog(
+  [
+    'opencode-go/gpt-6-luna',
+    JSON.stringify({ id: 'gpt-6-luna', variants: { low: {}, high: {}, max: {} } }, null, 2),
+    'opencode-go/plain-model',
+    JSON.stringify({ id: 'plain-model' }, null, 2),
+    'other/model-x',
+    JSON.stringify({ id: 'model-x', variants: { high: {} } }, null, 2)
+  ].join('\n')
+);
+
+test('unset, empty and blank settings take the defaults; set ones win, trimmed', () => {
+  const defaults = { model: DEFAULT_MODEL, effort: DEFAULT_EFFORT };
+  assert.deepEqual(resolveModelSettings(), defaults);
+  assert.deepEqual(resolveModelSettings({ model: undefined, effort: undefined }), defaults);
+  assert.deepEqual(resolveModelSettings({ model: '', effort: '' }), defaults);
+  assert.deepEqual(resolveModelSettings({ model: '  ', effort: '\n' }), defaults);
+  assert.deepEqual(resolveModelSettings({ model: ' other/model-x ', effort: ' max ' }), {
+    model: 'other/model-x',
+    effort: 'max'
+  });
+  // One set, one unset: each falls back on its own.
+  assert.deepEqual(resolveModelSettings({ model: 'other/model-x' }), { model: 'other/model-x', effort: DEFAULT_EFFORT });
+});
+
+test('the defaults are gpt-6-luna at high effort', () => {
+  assert.equal(DEFAULT_MODEL, 'opencode-go/gpt-6-luna');
+  assert.equal(DEFAULT_EFFORT, 'high');
+});
+
+test('parseModelCatalog reads ids and their effort variants', () => {
+  assert.deepEqual(CATALOG.get('opencode-go/gpt-6-luna'), ['low', 'high', 'max']);
+  assert.equal(CATALOG.get('opencode-go/plain-model'), null);
+  assert.equal(CATALOG.size, 3);
+  assert.equal(parseModelCatalog('').size, 0);
+});
+
+test('checkModelSettings accepts an offered model and effort', () => {
+  assert.equal(checkModelSettings({ model: DEFAULT_MODEL, effort: DEFAULT_EFFORT }, CATALOG).ok, true);
+});
+
+test('checkModelSettings fails closed on a bad model or effort', () => {
+  const unknown = checkModelSettings({ model: 'opencode-go/nope', effort: 'high' }, CATALOG);
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.reason, /"opencode-go\/nope" is not available/);
+  assert.match(unknown.reason, /opencode-go\/gpt-6-luna/);
+
+  const noProvider = checkModelSettings({ model: 'missing/model', effort: 'high' }, CATALOG);
+  assert.equal(noProvider.ok, false);
+  assert.match(noProvider.reason, /No "missing" provider/);
+
+  for (const model of ['gpt-6-luna', 'a b/c', 'opencode-go/', '/x']) {
+    const result = checkModelSettings({ model, effort: 'high' }, CATALOG);
+    assert.equal(result.ok, false, model);
+    assert.match(result.reason, /provider\/model/);
+  }
+
+  const effort = checkModelSettings({ model: DEFAULT_MODEL, effort: 'turbo' }, CATALOG);
+  assert.equal(effort.ok, false);
+  assert.match(effort.reason, /"turbo" is not supported.*low, high, max/);
+
+  const noVariants = checkModelSettings({ model: 'opencode-go/plain-model', effort: 'high' }, CATALOG);
+  assert.equal(noVariants.ok, false);
+  assert.match(noVariants.reason, /no effort levels/);
+
+  // An empty model list is an outage, not permission to proceed unchecked.
+  assert.equal(checkModelSettings({ model: DEFAULT_MODEL, effort: 'high' }, new Map()).ok, false);
+  assert.equal(checkModelSettings({ model: DEFAULT_MODEL, effort: 'high' }, null).ok, false);
+});
+
+test('a review names the model and effort in the line and the meta marker', () => {
+  const body = composeReviewComment({
+    body: '**Verdict: PASS**\nReviewed HEAD: `' + HEAD + '`\nok',
+    head: HEAD,
+    verdict: 'pass',
+    model: 'opencode-go/gpt-6-luna',
+    effort: 'high'
+  });
+  assert.ok(body.includes('model: opencode-go/gpt-6-luna · effort: high'));
+  assert.match(body.split('\n').at(-1), /"model":"opencode-go\/gpt-6-luna","effort":"high"/);
+  // The marker still parses and validates as before.
+  assert.deepEqual(parseMeta(body), { head: HEAD, verdict: 'pass' });
+  assert.equal(validateReview({ body, head: HEAD }).ok, true);
+});
+
+test('a comment with no model (a safety block) claims none', () => {
+  const body = safetyBlockedBody({ files: ['.github/workflows/opencode-review.yml'], head: HEAD });
+  assert.ok(!body.includes('model:'));
+  assert.ok(!body.includes('"model"'));
+});
+
+test('the workflow declares model and effort inputs with the stated defaults', () => {
+  const input = (name) =>
+    WORKFLOW.match(new RegExp(`^ {6}${name}:\\n(?: {8}.+\\n)*? {8}default: (.+)$`, 'm'))[1];
+  assert.equal(input('model'), DEFAULT_MODEL);
+  assert.equal(input('effort'), DEFAULT_EFFORT);
+});
+
+test('the agent file pins no model, so the workflow input is the only source', () => {
+  assert.ok(!/^model:/m.test(AGENT));
+  assert.match(WORKFLOW, /-m "\$KINSHO_MODEL" --variant "\$KINSHO_EFFORT"/);
+});
+
+test('the model is checked before the review runs and before anything is posted', () => {
+  const resolve = WORKFLOW.indexOf('review-cli.mjs resolveModel');
+  assert.ok(resolve > 0);
+  assert.ok(resolve < WORKFLOW.indexOf('Run Kinsho review'));
+  assert.ok(resolve < WORKFLOW.indexOf('Post review comment'));
+  // The run and the comment use the checked values, never the raw inputs.
+  assert.ok(WORKFLOW.includes('KINSHO_MODEL: ${{ steps.model.outputs.model }}'));
+  assert.ok(WORKFLOW.includes('REVIEW_MODEL: ${{ steps.model.outputs.model }}'));
+  assert.ok(!WORKFLOW.includes('KINSHO_MODEL: ${{ inputs.model }}'));
+});
+
+test('the README caller snippet passes both repository variables', () => {
+  assert.ok(README.includes('model: ${{ vars.KINSHO_MODEL }}'));
+  assert.ok(README.includes('effort: ${{ vars.KINSHO_EFFORT }}'));
 });

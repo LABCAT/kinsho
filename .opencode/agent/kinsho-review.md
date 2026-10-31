@@ -1,7 +1,6 @@
 ---
 mode: primary
 hidden: true
-model: opencode-go/muse-spark-1.3-contributor
 color: "#5b7cfa"
 permission:
   "*": deny
