@@ -26,6 +26,17 @@
 # Transient backend failures are retried with exponential backoff; a raw API error
 # is never posted as the review. A manual `/oc` comment re-triggers the review.
 #
+# Model and effort: the caller passes its repository variables, so switching is
+# `gh variable set KINSHO_MODEL` with no PR:
+#   with:
+#     model: ${{ vars.KINSHO_MODEL }}
+#     effort: ${{ vars.KINSHO_EFFORT }}
+# `vars` in this file would be the caller repository's too, but passing them
+# makes the caller's config visible. An unset variable is an empty string and
+# takes the defaults below (opencode-go/gpt-6-luna, high). The agent file pins no
+# model, so this is the single source of truth. A model or effort the backend does
+# not offer fails the run before anything is posted. The comment names both.
+#
 # Humans are the only merge authority: this workflow never approves, merges, or
 # pushes.
 
@@ -35,10 +46,15 @@ on:
   workflow_call:
     inputs:
       model:
-        description: Model the review runs on.
+        description: Model the review runs on, provider/model. Pass vars.KINSHO_MODEL; empty takes the default.
         type: string
         required: false
-        default: opencode-go/muse-spark-1.3-contributor
+        default: opencode-go/gpt-6-luna
+      effort:
+        description: Reasoning effort (the model's variant). Pass vars.KINSHO_EFFORT; empty takes the default.
+        type: string
+        required: false
+        default: high
       test_command:
         description: The repository's test command, named in the review checklist. Kinsho never runs it.
         type: string
@@ -141,6 +157,16 @@ jobs:
             exit 1
           fi
           echo "Kinsho: $KINSHO_REPOSITORY@$KINSHO_SHA"
+
+      # What the caller asked for, before anything can fail: an empty value means
+      # the variable is unset and the default applies once it is checked below.
+      - name: Log requested model and effort
+        env:
+          MODEL_INPUT: ${{ inputs.model }}
+          EFFORT_INPUT: ${{ inputs.effort }}
+        run: |
+          echo "Requested model: ${MODEL_INPUT:-<unset, default applies>}"
+          echo "Requested effort: ${EFFORT_INPUT:-<unset, default applies>}"
 
       # The verdict logic and the agent come from the Kinsho commit the caller
       # pinned, so neither the PR nor the caller's checkout supplies them.
@@ -407,6 +433,21 @@ jobs:
           npm install -g opencode-ai@1.18.34
           opencode --version
 
+      # Runs after install so the model list comes from the same CLI that runs the
+      # review. The list is fetched with the key set, as the review run sees it.
+      - name: Resolve model and effort
+        id: model
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          MODEL_INPUT: ${{ inputs.model }}
+          EFFORT_INPUT: ${{ inputs.effort }}
+          CATALOG_FILE: ${{ runner.temp }}/opencode-models.txt
+        run: |
+          set -euo pipefail
+          opencode models --verbose > "$CATALOG_FILE"
+          node .kinsho/.github/scripts/review-cli.mjs resolveModel
+
       # Transient backend failures (overload, rate limit, gateway, connection,
       # timeout) are retried with exponential backoff. The raw API error is
       # captured, never posted; `classify` decides whether the output is a review,
@@ -416,7 +457,8 @@ jobs:
         if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          KINSHO_MODEL: ${{ inputs.model }}
+          KINSHO_MODEL: ${{ steps.model.outputs.model }}
+          KINSHO_EFFORT: ${{ steps.model.outputs.effort }}
           REVIEW_TIMEOUT: 30m
           MAX_ATTEMPTS: 3
           PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
@@ -424,9 +466,9 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
           set -uo pipefail
-          model="${KINSHO_MODEL:-$(awk -F': ' '$1 == "model" { print $2; exit }' .opencode/agent/kinsho-review.md)}"
           echo "Review agent: kinsho-review"
-          echo "Review model: ${model:-unknown}"
+          echo "Review model: ${KINSHO_MODEL}"
+          echo "Review effort: ${KINSHO_EFFORT}"
 
           prompt="$(cat "$PROMPT_FILE")"
           kind=""; verdict=""; attempt=1; last_raw=""; exit_code=0
@@ -437,7 +479,7 @@ jobs:
             echo "::group::Kinsho review attempt ${attempt}/${MAX_ATTEMPTS}"
             set +e
             timeout --signal=TERM --kill-after=30s "$REVIEW_TIMEOUT" \
-              opencode run --format json --agent kinsho-review -m "$model" "$prompt" \
+              opencode run --format json --agent kinsho-review -m "$KINSHO_MODEL" --variant "$KINSHO_EFFORT" "$prompt" \
               > "$raw" 2> "$RUNNER_TEMP/review-attempt-${attempt}.err"
             exit_code=$?
             set -e
@@ -479,6 +521,8 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ROUTE: ${{ steps.pr.outputs.route }}
           ROUTING_MARKER: ${{ inputs.routing_marker }}
+          REVIEW_MODEL: ${{ steps.model.outputs.model }}
+          REVIEW_EFFORT: ${{ steps.model.outputs.effort }}
           MESSAGE_FILE: ${{ runner.temp }}/review-message.md
           COMMENT_FILE: ${{ runner.temp }}/review-comment.md
         run: |
@@ -566,6 +610,8 @@ jobs:
           VERDICT: ${{ steps.run.outputs.verdict }}
           ATTEMPTS: ${{ steps.run.outputs.attempts }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          REVIEW_MODEL: ${{ steps.model.outputs.model }}
+          REVIEW_EFFORT: ${{ steps.model.outputs.effort }}
         run: |
           {
             echo "### Kinsho review"
@@ -574,4 +620,5 @@ jobs:
             echo "- Outcome: \`${KIND:-not-run}\`"
             echo "- Verdict: \`${VERDICT:-none}\`"
             echo "- Attempts: \`${ATTEMPTS:-0}\`"
+            echo "- Model: \`${REVIEW_MODEL:-none}\`, effort: \`${REVIEW_EFFORT:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"

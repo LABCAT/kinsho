@@ -31,6 +31,8 @@ jobs:
     with:
       test_command: npm test
       check_command: npm run lint
+      model: ${{ vars.KINSHO_MODEL }}
+      effort: ${{ vars.KINSHO_EFFORT }}
     secrets:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       KINSHO_APP_ID: ${{ secrets.KINSHO_APP_ID }}
@@ -38,6 +40,17 @@ jobs:
 ```
 
 Comment `/oc` on a PR to re-run the review (needs write access). Draft PRs and PRs from forks are skipped.
+
+## Model and effort
+
+Switch them with repository variables, no PR needed:
+
+```bash
+gh variable set KINSHO_MODEL --body opencode-go/gpt-6-luna
+gh variable set KINSHO_EFFORT --body high
+```
+
+Both are optional. Unset (or empty), the review runs `opencode-go/gpt-6-luna` at `high`. GitHub resolves `vars` from the calling repo, so each project sets its own. A model or effort the backend doesn't offer fails the run with a message and posts nothing, so it can never count as a `PASS` or set `pr-ready`. The run log and the review comment state the model and effort used.
 
 If you name the file something else, add it to `protected_paths`, so a PR can't weaken its own reviewer.
 
@@ -47,7 +60,8 @@ All optional.
 
 | Input | Default | Purpose |
 |-------|---------|---------|
-| `model` | `opencode-go/muse-spark-1.3-contributor` | Model the review runs on |
+| `model` | `opencode-go/gpt-6-luna` | Model the review runs on; pass `vars.KINSHO_MODEL` |
+| `effort` | `high` | Reasoning effort (the model's variant); pass `vars.KINSHO_EFFORT` |
 | `test_command` | none | Test command named in the checklist; Kinsho never runs it |
 | `check_command` | none | Lint/check/build command named in the checklist; Kinsho never runs it |
 | `project_context` | none | One sentence describing your repo |

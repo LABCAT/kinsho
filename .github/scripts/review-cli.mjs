@@ -10,6 +10,7 @@
 //   labels    — compute the label transitions for a verdict
 //   missingLabels — list the review labels the repository lacks (name\tcolor\tdescription)
 //   requireSecrets — fail, naming them, when required secrets are unset
+//   resolveModel — settle KINSHO_MODEL / KINSHO_EFFORT (defaults) and check them against the CLI's model list
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 import {
@@ -24,7 +25,10 @@ import {
   missingReviewLabels,
   missingSecrets,
   reviewerOwnedChanges,
+  parseModelCatalog,
   parseProtectedPaths,
+  checkModelSettings,
+  resolveModelSettings,
   safetyBlockedBody,
   validateReview
 } from './review-verdict.mjs';
@@ -84,10 +88,18 @@ const commands = {
     // No verdict line means the model produced prose or an error, not a review.
     if (!verdict) fail('The review agent ended without a structured verdict; refusing to post it as a review.');
 
+    // A review names the model that produced it; without one there is nothing
+    // truthful to post.
+    if (!process.env.REVIEW_MODEL || !process.env.REVIEW_EFFORT) {
+      fail('REVIEW_MODEL and REVIEW_EFFORT are unset; refusing to post a review that cannot name its model.');
+    }
+
     const body = composeReviewComment({
       body: raw,
       head,
       verdict,
+      model: process.env.REVIEW_MODEL,
+      effort: process.env.REVIEW_EFFORT,
       runUrl: process.env.RUN_URL || '',
       // Only a verdict that asks for fixes is routed to the implementer; a PASS
       // has nothing to fix.
@@ -155,6 +167,21 @@ const commands = {
     for (const { name, color, description } of missing) {
       console.log([name, color, description].join('\t'));
     }
+  },
+
+  // The caller passes its KINSHO_MODEL / KINSHO_EFFORT variables; unset ones are
+  // empty strings and take the defaults. A model or effort the backend does not
+  // offer stops the run here, before anything is posted or labelled.
+  resolveModel() {
+    const settings = resolveModelSettings({
+      model: process.env.MODEL_INPUT,
+      effort: process.env.EFFORT_INPUT
+    });
+    const catalog = parseModelCatalog(readFileSync(process.env.CATALOG_FILE, 'utf8'));
+    const check = checkModelSettings(settings, catalog);
+    if (!check.ok) fail(`${check.reason} Set the KINSHO_MODEL and KINSHO_EFFORT repository variables, or unset them for the defaults.`);
+    output(settings);
+    console.log(`model: ${settings.model} effort: ${settings.effort}`);
   },
 
   // Names only: a secret's value is never read beyond whether it is set.

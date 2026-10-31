@@ -46,6 +46,11 @@ export const PREVIEW_URL_HEADER = '## Kinsho preview';
 
 export const META_MARKER_PREFIX = '<!-- oc-review-meta ';
 
+// Used when a caller's KINSHO_MODEL / KINSHO_EFFORT variable is unset or empty.
+// The workflow's input defaults must match; a test pins that.
+export const DEFAULT_MODEL = 'opencode-go/gpt-6-luna';
+export const DEFAULT_EFFORT = 'high';
+
 export const REQUIRED_SECRETS = ['OPENCODE_API_KEY', 'KINSHO_APP_ID', 'KINSHO_APP_PRIVATE_KEY'];
 
 export const VERDICTS = ['blocked', 'needs-evidence', 'pass'];
@@ -91,8 +96,84 @@ export function isReviewLabel(label) {
   return ALL_REVIEW_LABELS.includes(label);
 }
 
-export function metaMarker({ head, verdict }) {
-  return `${META_MARKER_PREFIX}${JSON.stringify({ head, verdict: normalizeVerdict(verdict) })} -->`;
+export function metaMarker({ head, verdict, model = '', effort = '' }) {
+  const meta = { head, verdict: normalizeVerdict(verdict) };
+  // Only a review a model produced names one; a safety block runs no model.
+  if (model) Object.assign(meta, { model, effort });
+  return `${META_MARKER_PREFIX}${JSON.stringify(meta)} -->`;
+}
+
+// An unset variable reaches the workflow as an empty string, which a `default:`
+// does not replace, so empty and blank values fall back here.
+export function resolveModelSettings({ model = '', effort = '' } = {}) {
+  return {
+    model: String(model ?? '').trim() || DEFAULT_MODEL,
+    effort: String(effort ?? '').trim() || DEFAULT_EFFORT
+  };
+}
+
+// Parse `opencode models --verbose`: an id line (`provider/model`) followed by
+// that model's JSON metadata. Returns Map<id, string[] | null> of effort variants.
+export function parseModelCatalog(text = '') {
+  const catalog = new Map();
+  let id = null;
+  let json = [];
+  const finish = () => {
+    if (!id) return;
+    let variants = null;
+    try {
+      const parsed = JSON.parse(json.join('\n'));
+      if (parsed?.variants && typeof parsed.variants === 'object') {
+        variants = Object.keys(parsed.variants);
+      }
+    } catch {
+      // Metadata we cannot read means no known variants; the id still counts.
+    }
+    catalog.set(id, variants);
+  };
+  for (const line of String(text).split('\n')) {
+    // Metadata lines start with `{`, `}` or indentation; an id starts in column 0.
+    if (/^[^\s{}/]+\/\S+$/.test(line)) {
+      finish();
+      id = line;
+      json = [];
+    } else if (id) {
+      json.push(line);
+    }
+  }
+  finish();
+  return catalog;
+}
+
+// Check the settings against the catalog the CLI reports. Fails closed: a model
+// or effort the backend does not offer is an error, never a silent fallback.
+export function checkModelSettings({ model, effort }, catalog) {
+  if (!/^[^\s/]+\/\S+$/.test(model)) {
+    return { ok: false, reason: `KINSHO_MODEL "${model}" must look like provider/model, for example ${DEFAULT_MODEL}.` };
+  }
+  if (!(catalog instanceof Map) || catalog.size === 0) {
+    return { ok: false, reason: 'Could not list the available models, so "' + model + '" cannot be checked.' };
+  }
+  if (!catalog.has(model)) {
+    const provider = model.split('/')[0];
+    const near = [...catalog.keys()].filter((id) => id.startsWith(`${provider}/`)).slice(0, 12);
+    return {
+      ok: false,
+      reason:
+        `Model "${model}" is not available.` +
+        (near.length ? ` Available ${provider} models include: ${near.join(', ')}.` : ` No "${provider}" provider is available.`)
+    };
+  }
+  const variants = catalog.get(model);
+  if (!variants || !variants.includes(effort)) {
+    return {
+      ok: false,
+      reason: variants?.length
+        ? `Effort "${effort}" is not supported by ${model}. Supported: ${variants.join(', ')}.`
+        : `${model} has no effort levels, so effort "${effort}" cannot be applied. Pick a model that supports effort.`
+    };
+  }
+  return { ok: true, reason: 'ok' };
 }
 
 // The machine-readable marker must be the final non-empty line, so a review can
@@ -142,7 +223,7 @@ export function validateReview({ body, head }) {
 // Compose the single immutable comment: one header, the model's body, the
 // reviewed head, an optional implementer routing marker, the run link, and the
 // machine-readable verdict as the final line.
-export function composeReviewComment({ body, head, verdict, runUrl = '', route = false, routingMarker = '' }) {
+export function composeReviewComment({ body, head, verdict, runUrl = '', route = false, routingMarker = '', model = '', effort = '' }) {
   const value = normalizeVerdict(verdict);
   if (!value) throw new Error(`composeReviewComment: unsupported verdict ${verdict}`);
 
@@ -163,11 +244,12 @@ export function composeReviewComment({ body, head, verdict, runUrl = '', route =
     out.push(`**Verdict: ${displayVerdict(value)}**`, `Reviewed HEAD: \`${head}\``, '');
   }
   out.push(lines.join('\n'));
+  if (model) out.push('', `model: ${model} · effort: ${effort}`);
   // The routing marker asks the implementer to pick up fixes, so it only ever
   // appears on a verdict that requests them — never on a PASS.
   if (route && routingMarker && value !== 'pass') out.push('', routingMarker);
   if (runUrl) out.push('', `[Review run](${runUrl})`);
-  out.push('', metaMarker({ head, verdict: value }));
+  out.push('', metaMarker({ head, verdict: value, model, effort }));
   return out.join('\n');
 }
 
