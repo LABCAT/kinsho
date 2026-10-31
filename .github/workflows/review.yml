@@ -1,0 +1,577 @@
+# Kinsho, the gold general: an automated PR reviewer, as a reusable workflow.
+#
+#   uses: LABCAT/kinsho/.github/workflows/review.yml@v0.1.0
+#
+# Kinsho reviews a pull request and states a verdict up front: BLOCKED,
+# NEEDS_EVIDENCE, or PASS. Findings cite `file:line` with a suggested fix, and the
+# review is checked against the linked task's definition of done and the rules the
+# caller passes in.
+#
+# Identity: the reviewer posts through a GitHub App installation token. It never
+# posts as `github-actions[bot]`, so the reviewer and CI are distinguishable by
+# author. The workflow fails visibly when a required secret is unset.
+#
+# One immutable comment per run: every run creates a new comment and never edits a
+# prior one, so a re-review shows as a new entry and the two runs on one PR are
+# two separate comments. Every reviewer comment starts with `## Kinsho review` and
+# states the reviewed head SHA.
+#
+# Labels (the trusted signals, written only by this workflow):
+#   PASS on the current head            -> pr-ready
+#   BLOCKED                             -> review:blocked   (removes pr-ready)
+#   NEEDS_EVIDENCE                      -> review:needs-evidence (removes pr-ready)
+#   backend failed after all retries     -> review:automation-failed
+# `pr-ready` is only ever set for a PASS whose metadata names the current head SHA.
+#
+# Transient backend failures are retried with exponential backoff; a raw API error
+# is never posted as the review. A manual `/oc` comment re-triggers the review.
+#
+# Humans are the only merge authority: this workflow never approves, merges, or
+# pushes.
+
+name: kinsho-review
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Model the review runs on.
+        type: string
+        required: false
+        default: opencode-go/muse-spark-1.3-contributor
+      test_command:
+        description: The repository's test command, named in the review checklist. Kinsho never runs it.
+        type: string
+        required: false
+        default: ''
+      check_command:
+        description: The repository's lint/check/build command, named in the review checklist. Kinsho never runs it.
+        type: string
+        required: false
+        default: ''
+      project_context:
+        description: One sentence describing the repository, completing "the reviewer for owner/repo:".
+        type: string
+        required: false
+        default: ''
+      review_rules:
+        description: Repository checklist items, numbered from 2, one per line or wrapped with indentation.
+        type: string
+        required: false
+        default: ''
+      protected_paths:
+        description: Extra path regexes, one per line. A PR touching one is BLOCKED for human review.
+        type: string
+        required: false
+        default: ''
+      routing_marker:
+        description: HTML comment added to fix-requesting reviews of routed PRs, for an implementer bot. Empty turns routing off.
+        type: string
+        required: false
+        default: ''
+      route_branch_prefix:
+        description: PRs from branches with this prefix are routed.
+        type: string
+        required: false
+        default: ''
+      route_body_marker:
+        description: PRs whose body contains this text are routed.
+        type: string
+        required: false
+        default: ''
+    secrets:
+      OPENCODE_API_KEY:
+        description: API key for the review model.
+        required: true
+      KINSHO_APP_ID:
+        description: GitHub App ID the reviewer posts as.
+        required: true
+      KINSHO_APP_PRIVATE_KEY:
+        description: Private key of that GitHub App.
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    # Auto-review on PR activity (same-repo heads only: fork PRs never get the
+    # app credentials), or on demand when an `/oc` comment lands on a PR.
+    # The comment must *start* with the command and must not come from a bot, so a
+    # review that mentions `/oc` (such as the automation-failure notice) cannot
+    # re-trigger itself in a loop.
+    if: |
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       !endsWith(github.event.comment.user.login, '[bot]') &&
+       (startsWith(github.event.comment.body, '/oc') ||
+        startsWith(github.event.comment.body, '@kinsho')))
+    runs-on: ubuntu-latest
+    concurrency:
+      # Comment-triggered runs get their own group so a skipped non-command comment
+      # cannot cancel an in-flight review.
+      group: opencode-review-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      # Always the trusted default branch, never the PR head: the workflow, the
+      # reviewer config, and the verdict logic must be the reviewed-and-merged
+      # versions. PR content is fetched separately through the API below, so a PR
+      # cannot supply the code that judges it.
+      - name: Checkout trusted reviewer
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # An empty `repository` would make checkout fall back to the caller's repo,
+      # so a missing value stops here instead of running the wrong code.
+      - name: Resolve Kinsho version
+        env:
+          KINSHO_REPOSITORY: ${{ job.workflow_repository }}
+          KINSHO_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$KINSHO_REPOSITORY" ] || [ -z "$KINSHO_SHA" ]; then
+            echo "::error::Could not resolve the Kinsho workflow repository and commit (job.workflow_repository, job.workflow_sha)."
+            exit 1
+          fi
+          echo "Kinsho: $KINSHO_REPOSITORY@$KINSHO_SHA"
+
+      # The verdict logic and the agent come from the Kinsho commit the caller
+      # pinned, so neither the PR nor the caller's checkout supplies them.
+      - name: Checkout Kinsho
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .kinsho
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require Kinsho secrets
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          KINSHO_APP_ID: ${{ secrets.KINSHO_APP_ID }}
+          KINSHO_APP_PRIVATE_KEY: ${{ secrets.KINSHO_APP_PRIVATE_KEY }}
+        run: node .kinsho/.github/scripts/review-cli.mjs requireSecrets
+
+      - name: Generate Kinsho app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KINSHO_APP_ID }}
+          private-key: ${{ secrets.KINSHO_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Authorise manual review command
+        id: access
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A manual command needs write access; `author_association` hides private
+          # org members, so ask for the repository permission itself.
+          permission="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${COMMENTER}/permission" --jq '.permission' 2>/dev/null)" || permission="none"
+          case "$permission" in
+            admin|write) echo "allowed=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::notice::${COMMENTER} has ${permission} access; reviewer commands need write access."
+              echo "allowed=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Resolve pull request context
+        id: pr
+        if: steps.access.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          ROUTING_MARKER: ${{ inputs.routing_marker }}
+          ROUTE_BRANCH_PREFIX: ${{ inputs.route_branch_prefix }}
+          ROUTE_BODY_MARKER: ${{ inputs.route_body_marker }}
+        run: |
+          pr_json="$(gh pr view "$EVENT_PR_NUMBER" --json number,url,author,baseRefName,headRefName,headRefOid,isDraft,body)"
+          {
+            echo "number=$(printf '%s' "$pr_json" | jq -r '.number')"
+            echo "url=$(printf '%s' "$pr_json" | jq -r '.url')"
+            echo "head_sha=$(printf '%s' "$pr_json" | jq -r '.headRefOid')"
+            echo "base_ref=$(printf '%s' "$pr_json" | jq -r '.baseRefName')"
+            echo "head_ref=$(printf '%s' "$pr_json" | jq -r '.headRefName')"
+            echo "author=$(printf '%s' "$pr_json" | jq -r '.author.login')"
+          } >> "$GITHUB_OUTPUT"
+
+          # Routed PRs get the routing marker so an implementer bot picks up the
+          # fixes; other PRs are reviewed but never routed.
+          head_ref="$(printf '%s' "$pr_json" | jq -r '.headRefName')"
+          body="$(printf '%s' "$pr_json" | jq -r '.body // ""')"
+          route=false
+          if [ -n "$ROUTING_MARKER" ]; then
+            if [ -n "$ROUTE_BRANCH_PREFIX" ] && [[ "$head_ref" == "$ROUTE_BRANCH_PREFIX"* ]]; then
+              route=true
+            elif [ -n "$ROUTE_BODY_MARKER" ] && printf '%s' "$body" | grep -qF -- "$ROUTE_BODY_MARKER"; then
+              route=true
+            fi
+          fi
+          echo "route=$route" >> "$GITHUB_OUTPUT"
+
+      # `gh pr edit --add-label` fails on a label the repository lacks, so create
+      # any missing review label first. `--force` keeps a concurrent run that
+      # created it a moment earlier from failing this one.
+      - name: Ensure review labels exist
+        if: steps.access.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          existing="$(gh label list --repo "$GITHUB_REPOSITORY" --limit 1000 --json name --jq '[.[].name]')"
+          EXISTING_LABELS="$existing" node .kinsho/.github/scripts/review-cli.mjs missingLabels \
+            | while IFS=$'\t' read -r name color description; do
+                gh label create "$name" --repo "$GITHUB_REPOSITORY" --color "$color" --description "$description" --force
+              done
+
+      # A PR that edits the reviewer's own policy or trust-boundary files cannot be
+      # cleared by the automated reviewer. It is blocked and handed to a human, and
+      # the model run is skipped so a weakened reviewer cannot approve itself.
+      - name: Check review safety
+        id: safety
+        if: steps.access.outputs.allowed == 'true'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PROTECTED_PATHS: ${{ inputs.protected_paths }}
+        run: |
+          set -euo pipefail
+          files="$(gh pr diff "$PR_NUMBER" --name-only | jq -R -s 'split("\n") | map(select(length > 0))')"
+          CHANGED_FILES="$files" node .kinsho/.github/scripts/review-cli.mjs safety
+
+      # A new head invalidates the previous signals: drop pr-ready and any verdict
+      # label so the gated preview cannot publish an unreviewed head. They are
+      # re-applied below from this run's verdict.
+      - name: Reset review signals on a new head
+        if: steps.access.outputs.allowed == 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          remove_args=()
+          while IFS= read -r label; do
+            case "$label" in
+              pr-ready|review:blocked|review:needs-evidence|review:automation-failed)
+                remove_args+=(--remove-label "$label") ;;
+            esac
+          done < <(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
+          if [ "${#remove_args[@]}" -gt 0 ]; then
+            gh pr edit "$PR_NUMBER" "${remove_args[@]}"
+          fi
+
+      - name: Post safety-blocked review
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ROUTE: ${{ steps.pr.outputs.route }}
+          ROUTING_MARKER: ${{ inputs.routing_marker }}
+          OWNED_FILES: ${{ steps.safety.outputs.files }}
+          COMMENT_FILE: ${{ runner.temp }}/review-safety.md
+        run: |
+          set -euo pipefail
+          node .kinsho/.github/scripts/review-cli.mjs safetyComment
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$(cat "$COMMENT_FILE")" > /dev/null
+
+          # Same transition as any other BLOCKED verdict: drop pr-ready and clear
+          # the other verdict label. The reset step above only runs on a
+          # pull_request event, so an /oc re-trigger must do it here too.
+          current_labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | @json')"
+          safety_labels="$RUNNER_TEMP/safety-labels.out"
+          : > "$safety_labels"
+          CURRENT_LABELS="$current_labels" ON_HEAD=true VERDICT=blocked \
+            GITHUB_OUTPUT="$safety_labels" node .kinsho/.github/scripts/review-cli.mjs labels
+          remove_args=()
+          for label in $(sed -n 's/^remove=//p' "$safety_labels" | tail -1); do
+            remove_args+=(--remove-label "$label")
+          done
+          add_args=()
+          for label in $(sed -n 's/^add=//p' "$safety_labels" | tail -1); do
+            add_args+=(--add-label "$label")
+          done
+          if [ "${#remove_args[@]}" -eq 0 ] && [ "${#add_args[@]}" -eq 0 ]; then
+            echo "No label change needed."
+            exit 0
+          fi
+          gh pr edit "$PR_NUMBER" ${remove_args[@]+"${remove_args[@]}"} ${add_args[@]+"${add_args[@]}"}
+
+      # Everything the reviewer reads is fetched here with the app token: the
+      # agent itself has read-only local tools and no network access.
+      - name: Collect pull request context
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REVIEW_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          CONTEXT_DIR: .review-context
+        run: |
+          set -euo pipefail
+          context="$CONTEXT_DIR"
+          rm -rf "$context"
+          mkdir -p "$context"
+
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json title,body,author,baseRefName,headRefName,headRefOid,labels,commits,files,reviewDecision,comments,reviews \
+            > "$context/pr.json"
+
+          # Review the HEAD this run was started for, never a moving target.
+          head="$(jq -r '.headRefOid' "$context/pr.json")"
+          if [ "$head" != "$REVIEW_HEAD_SHA" ]; then
+            echo "::error::PR HEAD moved from $REVIEW_HEAD_SHA to $head before the review started."
+            exit 1
+          fi
+
+          gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --patch > "$context/pr.patch"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" --paginate \
+            | jq -s 'add // []' > "$context/review-comments.json"
+
+          # Whole changed files as they stand at the reviewed HEAD, so the reviewer
+          # reads more than the patch's context lines. Text files up to 1 MB.
+          mkdir -p "$context/head"
+          jq -r '.files[].path' "$context/pr.json" | while read -r path; do
+            target="$context/head/$path"
+            mkdir -p "$(dirname "$target")"
+            encoded="$(jq -rn --arg path "$path" '$path | split("/") | map(@uri) | join("/")')"
+            if ! gh api -H "Accept: application/vnd.github.raw" \
+              "repos/${GITHUB_REPOSITORY}/contents/${encoded}?ref=${REVIEW_HEAD_SHA}" > "$target" 2>/dev/null; then
+              rm -f "$target"
+              continue
+            fi
+            if [ "$(wc -c < "$target")" -gt 1000000 ]; then
+              rm -f "$target"
+            fi
+          done
+
+          # Issues and pull requests this PR references, such as the task it fixes:
+          # the definition of done the review is checked against.
+          mkdir -p "$context/linked"
+          # `grep` exits 1 when nothing matches (a PR that links no issue), which
+          # `pipefail` would turn into a failed step, so each filter tolerates it.
+          jq -r '.body // ""' "$context/pr.json" \
+            | { grep -oE "(#|github\.com/${GITHUB_REPOSITORY}/(issues|pull)/)[0-9]+" || true; } \
+            | { grep -oE '[0-9]+$' || true; } | { grep -vx "$PR_NUMBER" || true; } | sort -un | head -n 10 \
+            | while read -r number; do
+                gh issue view "$number" --repo "$GITHUB_REPOSITORY" \
+                  --json number,title,body,state,labels,comments,closedAt,url > "$context/linked/${number}.json" 2>/dev/null \
+                  || gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
+                    --json number,title,body,state,labels,comments,closedAt,url > "$context/linked/${number}.json" \
+                  || rm -f "$context/linked/${number}.json"
+              done
+
+          find "$context" -type f | sort
+
+      - name: Build review prompt
+        id: prompt
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
+        env:
+          PROMPT_FILE: ${{ runner.temp }}/review-prompt.md
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          TASK_REF: ${{ steps.pr.outputs.url }}
+          PROJECT_CONTEXT: ${{ inputs.project_context }}
+          REVIEW_RULES: ${{ inputs.review_rules }}
+          TEST_COMMAND: ${{ inputs.test_command }}
+          CHECK_COMMAND: ${{ inputs.check_command }}
+        run: |
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+          node .kinsho/.github/scripts/review-cli.mjs prompt
+
+      - name: Install opencode
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
+        run: |
+          mkdir -p .opencode/agent
+          cp .kinsho/.opencode/agent/kinsho-review.md .opencode/agent/kinsho-review.md
+          npm install -g opencode-ai@1.18.34
+          opencode --version
+
+      # Transient backend failures (overload, rate limit, gateway, connection,
+      # timeout) are retried with exponential backoff. The raw API error is
+      # captured, never posted; `classify` decides whether the output is a review,
+      # a retryable failure, or an unrecoverable one.
+      - name: Run Kinsho review
+        id: run
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          KINSHO_MODEL: ${{ inputs.model }}
+          REVIEW_TIMEOUT: 30m
+          MAX_ATTEMPTS: 3
+          PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
+          MESSAGE_FILE: ${{ runner.temp }}/review-message.md
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -uo pipefail
+          model="${KINSHO_MODEL:-$(awk -F': ' '$1 == "model" { print $2; exit }' .opencode/agent/kinsho-review.md)}"
+          echo "Review agent: kinsho-review"
+          echo "Review model: ${model:-unknown}"
+
+          prompt="$(cat "$PROMPT_FILE")"
+          kind=""; verdict=""; attempt=1; last_raw=""; exit_code=0
+
+          while : ; do
+            raw="$RUNNER_TEMP/review-attempt-${attempt}.jsonl"
+            last_raw="$raw"
+            echo "::group::Kinsho review attempt ${attempt}/${MAX_ATTEMPTS}"
+            set +e
+            timeout --signal=TERM --kill-after=30s "$REVIEW_TIMEOUT" \
+              opencode run --format json --agent kinsho-review -m "$model" "$prompt" \
+              > "$raw" 2> "$RUNNER_TEMP/review-attempt-${attempt}.err"
+            exit_code=$?
+            set -e
+            echo "opencode exit code: $exit_code"
+            echo "::endgroup::"
+
+            classify_out="$RUNNER_TEMP/classify-${attempt}.out"
+            : > "$classify_out"
+            RAW_FILE="$raw" EXIT_CODE="$exit_code" MESSAGE_FILE="$MESSAGE_FILE" \
+              GITHUB_OUTPUT="$classify_out" node .kinsho/.github/scripts/review-cli.mjs classify
+            kind="$(sed -n 's/^kind=//p' "$classify_out" | tail -1)"
+            verdict="$(sed -n 's/^verdict=//p' "$classify_out" | tail -1)"
+
+            if [ "$kind" = "review" ]; then break; fi
+            if [ "$kind" = "transient" ] && [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              delay="$(ATTEMPT="$attempt" node .kinsho/.github/scripts/review-cli.mjs backoff)"
+              echo "::warning::Transient backend failure; retrying in ${delay}ms (attempt $((attempt + 1))/${MAX_ATTEMPTS})."
+              sleep "$((delay / 1000))"
+              attempt=$((attempt + 1))
+              continue
+            fi
+            break
+          done
+
+          {
+            echo "kind=$kind"
+            echo "verdict=$verdict"
+            echo "attempts=$attempt"
+            echo "raw=$last_raw"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        id: post
+        if: steps.access.outputs.allowed == 'true' && steps.run.outputs.kind == 'review'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ROUTE: ${{ steps.pr.outputs.route }}
+          ROUTING_MARKER: ${{ inputs.routing_marker }}
+          MESSAGE_FILE: ${{ runner.temp }}/review-message.md
+          COMMENT_FILE: ${{ runner.temp }}/review-comment.md
+        run: |
+          set -euo pipefail
+          current_head="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')"
+          if [ "$current_head" != "$HEAD_SHA" ]; then
+            echo "::notice::PR HEAD moved to $current_head during review; not posting a stale review."
+            echo "posted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          node .kinsho/.github/scripts/review-cli.mjs comment
+
+          # Always a new comment: a re-review is a new entry, never an edit.
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$(cat "$COMMENT_FILE")" > /dev/null
+          echo "posted=true" >> "$GITHUB_OUTPUT"
+
+      # pr-ready is set only for a PASS whose metadata names the current head SHA.
+      - name: Apply review labels
+        id: labels
+        if: steps.access.outputs.allowed == 'true' && steps.run.outputs.kind == 'review' && steps.post.outputs.posted == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          VERDICT: ${{ steps.run.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          current_head="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')"
+          on_head=false
+          if [ "$current_head" = "$HEAD_SHA" ]; then on_head=true; fi
+
+          current_labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | @json')"
+          CURRENT_LABELS="$current_labels" ON_HEAD="$on_head" node .kinsho/.github/scripts/review-cli.mjs labels
+
+      - name: Update labels
+        if: steps.labels.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          ADD: ${{ steps.labels.outputs.add }}
+          REMOVE: ${{ steps.labels.outputs.remove }}
+        run: |
+          set -euo pipefail
+          args=()
+          for label in $REMOVE; do args+=(--remove-label "$label"); done
+          for label in $ADD; do args+=(--add-label "$label"); done
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "No label change needed."
+            exit 0
+          fi
+          gh pr edit "$PR_NUMBER" "${args[@]}"
+
+      # A backend failure must never stand as the reviewer's voice: it is posted
+      # with an explicit "not a verdict" line and labelled, never as a raw API
+      # error and never with a verdict label. A prior PASS is left untouched.
+      - name: Report automation failure
+        if: steps.access.outputs.allowed == 'true' && steps.run.outputs.kind != 'review' && steps.run.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ATTEMPTS: ${{ steps.run.outputs.attempts }}
+          ERROR_FILE: ${{ steps.run.outputs.raw }}
+          COMMENT_FILE: ${{ runner.temp }}/review-failure.md
+        run: |
+          set -euo pipefail
+          node .kinsho/.github/scripts/review-cli.mjs failure
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$(cat "$COMMENT_FILE")" > /dev/null
+
+          current_head="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')"
+          if [ "$current_head" != "$HEAD_SHA" ]; then
+            echo "::notice::PR HEAD moved during review; not labelling a stale automation failure."
+            exit 0
+          fi
+          gh pr edit "$PR_NUMBER" --add-label "review:automation-failed"
+
+      - name: Summarise verdict
+        if: always() && steps.access.outputs.allowed == 'true'
+        env:
+          KIND: ${{ steps.run.outputs.kind }}
+          VERDICT: ${{ steps.run.outputs.verdict }}
+          ATTEMPTS: ${{ steps.run.outputs.attempts }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          {
+            echo "### Kinsho review"
+            echo
+            echo "- HEAD: \`${HEAD_SHA:-unknown}\`"
+            echo "- Outcome: \`${KIND:-not-run}\`"
+            echo "- Verdict: \`${VERDICT:-none}\`"
+            echo "- Attempts: \`${ATTEMPTS:-0}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
