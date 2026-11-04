@@ -32,6 +32,7 @@ import {
   safetyBlockedBody,
   validateReview
 } from './review-verdict.mjs';
+import { findLeak } from './tool-policy.mjs';
 
 const [, , command] = process.argv;
 
@@ -47,6 +48,16 @@ function fail(message) {
   process.exit(1);
 }
 
+// A comment is public. Refuse to post one that contains a credential, whatever
+// put it there (a planted instruction, a log line, a tool's output).
+function assertNoLeak(body) {
+  const secrets = Object.entries(process.env)
+    .filter(([name]) => name.startsWith('LEAK_'))
+    .map(([, value]) => value);
+  const leak = findLeak(body, secrets);
+  if (leak) fail(`The comment contains ${leak}; refusing to post it.`);
+}
+
 const commands = {
   prompt() {
     const prompt = buildReviewPrompt({
@@ -60,7 +71,8 @@ const commands = {
       projectContext: process.env.PROJECT_CONTEXT || '',
       reviewRules: process.env.REVIEW_RULES || '',
       testCommand: process.env.TEST_COMMAND || '',
-      checkCommand: process.env.CHECK_COMMAND || ''
+      checkCommand: process.env.CHECK_COMMAND || '',
+      commandsEnabled: process.env.COMMANDS_ENABLED === 'true'
     });
     writeFileSync(process.env.PROMPT_FILE, prompt);
     console.log(`prompt: ${prompt.length} bytes -> ${process.env.PROMPT_FILE}`);
@@ -110,6 +122,7 @@ const commands = {
     const check = validateReview({ body, head });
     if (!check.ok) fail(`Composed review failed validation: ${check.reason}`);
 
+    assertNoLeak(body);
     writeFileSync(process.env.COMMENT_FILE, body);
     output({ verdict });
     console.log(`comment: verdict=${verdict} -> ${process.env.COMMENT_FILE}`);
@@ -126,6 +139,7 @@ const commands = {
       attempts: Number(process.env.ATTEMPTS || 0),
       error
     });
+    assertNoLeak(body);
     writeFileSync(process.env.COMMENT_FILE, body);
     console.log(`failure comment -> ${process.env.COMMENT_FILE}`);
   },
