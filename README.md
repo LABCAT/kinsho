@@ -67,6 +67,8 @@ All optional.
 | `project_context` | none | One sentence describing your repo |
 | `review_rules` | none | Your checklist items, numbered from `2.` |
 | `protected_paths` | none | Extra path regexes, one per line; a PR touching one is `BLOCKED` for human review |
+| `evidence_checks` | none | Check-run names that count as runtime evidence, one per line; see [Evidence](#evidence) |
+| `evidence_wait_minutes` | `20` | How long to wait for `evidence_checks` to finish before reviewing |
 | `routing_marker` | none | HTML comment added to fix-requesting reviews of routed PRs; empty turns routing off |
 | `route_branch_prefix` | none | Route PRs from branches with this prefix |
 | `route_body_marker` | none | Route PRs whose body contains this text |
@@ -81,7 +83,23 @@ All required. The run fails and names any that are unset.
 | `KINSHO_APP_ID` | ID of the GitHub App the review posts as |
 | `KINSHO_APP_PRIVATE_KEY` | Private key of that app |
 
-The app needs read access to contents and write access to issues and pull requests, and must be installed on your repo.
+The app needs read access to contents and checks, write access to issues and pull requests, and must be installed on your repo. Without checks access the review still runs, but CI evidence reads as unavailable (see [Evidence](#evidence)).
+
+## Evidence
+
+What the PR author says is not evidence. "Verified", "works", "tested locally" or "`/admin` redirects to login" in the body, commits or comments never counts toward `PASS`. The only evidence is the check runs CI recorded on the PR's head SHA, which Kinsho reads before the review. A check counts only when it completed with `success`.
+
+A runtime change (app code, config, auth/access control, dependencies, migrations, CI) needs a check that ran the app, such as a browser or e2e smoke test. Typecheck, lint, unit tests and a build don't. Without one the verdict is `NEEDS_EVIDENCE`, naming the missing check. Docs-only, test-only and comment-only changes are exempt.
+
+Name your runtime checks to make this a hard rule instead of the model's judgement:
+
+```yaml
+    with:
+      evidence_checks: |
+        e2e / admin smoke
+```
+
+Use the check-run name as the PR's checks list shows it. Kinsho waits up to `evidence_wait_minutes` for them to finish, then, on a runtime change, turns any `PASS` into `NEEDS_EVIDENCE` unless each one is green on the head. It also does that when check runs can't be read, or when the PR edits `.github/workflows/` or `.github/actions/` (a PR can't vouch for itself with checks it redefines). Re-run with `/oc` once the checks pass.
 
 ## Labels
 
