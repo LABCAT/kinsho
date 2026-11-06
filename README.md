@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   review:
-    uses: LABCAT/kinsho/.github/workflows/review.yml@v0.1.0
+    uses: LABCAT/kinsho/.github/workflows/review.yml@v0.3.0
     with:
       test_command: npm test
       check_command: npm run lint
@@ -68,6 +68,8 @@ All optional.
 | `project_context` | none | One sentence describing your repo |
 | `review_rules` | none | Your checklist items, numbered from `2.` |
 | `protected_paths` | none | Extra path regexes, one per line; a PR touching one is `BLOCKED` for human review |
+| `evidence_checks` | none | Check-run names that count as runtime evidence, one per line; see [Evidence](#evidence) |
+| `evidence_wait_minutes` | `20` | How long to wait for `evidence_checks` to finish before reviewing |
 | `routing_marker` | none | HTML comment added to fix-requesting reviews of routed PRs; empty turns routing off |
 | `route_branch_prefix` | none | Route PRs from branches with this prefix |
 | `route_body_marker` | none | Route PRs whose body contains this text |
@@ -82,7 +84,7 @@ All required. The run fails and names any that are unset.
 | `KINSHO_APP_ID` | ID of the GitHub App the review posts as |
 | `KINSHO_APP_PRIVATE_KEY` | Private key of that app |
 
-The app needs write access to issues and pull requests, and read access to contents, actions and checks, and must be installed on your repo. The model step gets a separate token with read access only; the comment and labels are written by later steps with the write token.
+The app needs write access to issues and pull requests, and read access to contents, actions and checks, and must be installed on your repo. The model step gets a separate token with read access only; the comment and labels are written by later steps with the write token. Without checks access the review still runs, but CI evidence reads as unavailable (see [Evidence](#evidence)).
 
 ## Tools
 
@@ -93,6 +95,22 @@ The reviewer has no general shell. Beyond reading files it can:
 - Run your `test_command` and `check_command` on the PR head. They run as a separate user with an empty environment, so they can't read the API key or the GitHub token. The sandbox starts from a clean checkout with nothing installed, so put the install in the command, for example `pnpm install --frozen-lockfile && pnpm test`. Set `run_commands: false` if they are slow. The sandbox needs a GitHub-hosted Linux runner with `sudo`.
 
 Two locks apply to every bash call: the agent file's permission list, and the guard plugin, which accepts only the two Kinsho scripts with plain or single-quoted arguments. A planted instruction can't widen either list, and a comment containing the API key or a GitHub token is not posted. It can still try to sway the verdict text, as with any model review.
+
+## Evidence
+
+What the PR author says is not evidence. "Verified", "works", "tested locally" or "`/admin` redirects to login" in the body, commits or comments never counts toward `PASS`. The only evidence is the check runs CI recorded on the PR's head SHA, which Kinsho reads before the review. A check counts only when it completed with `success`.
+
+A runtime change (app code, config, auth/access control, dependencies, migrations, CI) needs a check that ran the app, such as a browser or e2e smoke test. Typecheck, lint, unit tests and a build don't. Without one the verdict is `NEEDS_EVIDENCE`, naming the missing check. Docs-only, test-only and comment-only changes are exempt.
+
+Name your runtime checks to make this a hard rule instead of the model's judgement:
+
+```yaml
+    with:
+      evidence_checks: |
+        e2e / admin smoke
+```
+
+Use the check-run name as the PR's checks list shows it. Kinsho waits up to `evidence_wait_minutes` for them to finish, then, on a runtime change, turns any `PASS` into `NEEDS_EVIDENCE` unless each one is green on the head. It also does that when check runs can't be read, or when the PR edits `.github/workflows/` or `.github/actions/` (a PR can't vouch for itself with checks it redefines). Re-run with `/oc` once the checks pass.
 
 ## Labels
 

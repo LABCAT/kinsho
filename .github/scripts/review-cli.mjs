@@ -10,8 +10,11 @@
 //   labels    — compute the label transitions for a verdict
 //   missingLabels — list the review labels the repository lacks (name\tcolor\tdescription)
 //   requireSecrets — fail, naming them, when required secrets are unset
+//   evidencePending — print the evidence checks not yet finished on the head, one per line
 //   resolveModel — settle KINSHO_MODEL / KINSHO_EFFORT (defaults) and check them against the CLI's model list
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+
+import { applyEvidenceGate, evaluateEvidence, parseEvidenceChecks, pendingEvidenceChecks } from './review-evidence.mjs';
 
 import {
   automationFailureComment,
@@ -44,6 +47,16 @@ function output(pairs) {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${lines.join('\n')}\n`);
 }
 
+// A file that is missing or unreadable is null, so the evidence gate fails closed.
+function readOptional(path, parse = (text) => text) {
+  if (!path || !existsSync(path)) return null;
+  try {
+    return parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
 function fail(message) {
   console.error(`::error::${message}`);
   process.exit(1);
@@ -73,7 +86,8 @@ const commands = {
       reviewRules: process.env.REVIEW_RULES || '',
       testCommand: process.env.TEST_COMMAND || '',
       checkCommand: process.env.CHECK_COMMAND || '',
-      commandsEnabled: process.env.COMMANDS_ENABLED === 'true'
+      commandsEnabled: process.env.COMMANDS_ENABLED === 'true',
+      evidenceChecks: parseEvidenceChecks(process.env.EVIDENCE_CHECKS)
     });
     writeFileSync(process.env.PROMPT_FILE, prompt);
     console.log(`prompt: ${prompt.length} bytes -> ${process.env.PROMPT_FILE}`);
@@ -102,10 +116,21 @@ const commands = {
 
   comment() {
     const head = process.env.HEAD_SHA || '';
-    const raw = readFileSync(process.env.MESSAGE_FILE, 'utf8');
-    const verdict = extractVerdict(raw);
+    const modelRaw = readFileSync(process.env.MESSAGE_FILE, 'utf8');
+    const modelVerdict = extractVerdict(modelRaw);
     // No verdict line means the model produced prose or an error, not a review.
-    if (!verdict) fail('The review agent ended without a structured verdict; refusing to post it as a review.');
+    if (!modelVerdict) fail('The review agent ended without a structured verdict; refusing to post it as a review.');
+
+    // A PASS on a runtime change stands only with the caller's evidence checks
+    // green on this head; the model's word is not enough.
+    const gate = evaluateEvidence({
+      diff: readOptional(process.env.DIFF_FILE),
+      checks: readOptional(process.env.CHECKS_FILE, JSON.parse),
+      required: parseEvidenceChecks(process.env.EVIDENCE_CHECKS),
+      head
+    });
+    const { verdict, body: raw, downgraded } = applyEvidenceGate({ verdict: modelVerdict, body: modelRaw, gate, head });
+    console.log(`evidence gate: ${gate.ok ? 'ok' : 'failed'} (${gate.reason})${downgraded ? '; PASS -> NEEDS_EVIDENCE' : ''}`);
 
     // A review names the model that produced it; without one there is nothing
     // truthful to post.
@@ -188,6 +213,13 @@ const commands = {
     for (const { name, color, description } of missing) {
       console.log([name, color, description].join('\t'));
     }
+  },
+
+  // Names the workflow is still waiting for before it collects the evidence.
+  evidencePending() {
+    const checks = readOptional(process.env.CHECKS_FILE, JSON.parse);
+    const pending = pendingEvidenceChecks(checks, parseEvidenceChecks(process.env.EVIDENCE_CHECKS));
+    if (pending.length) console.log(pending.join('\n'));
   },
 
   // The caller passes its KINSHO_MODEL / KINSHO_EFFORT variables; unset ones are
