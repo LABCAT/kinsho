@@ -4,6 +4,8 @@
 // Plain .mjs with no dependencies so `node --test` and the workflow's node
 // steps exercise the same functions.
 
+import { evidencePromptSection } from './review-evidence.mjs';
+
 export const PR_READY_LABEL = 'pr-ready';
 export const REVIEW_BLOCKED_LABEL = 'review:blocked';
 export const REVIEW_NEEDS_EVIDENCE_LABEL = 'review:needs-evidence';
@@ -438,7 +440,8 @@ export function buildReviewPrompt({
   projectContext = '',
   reviewRules = '',
   testCommand = '',
-  checkCommand = ''
+  checkCommand = '',
+  evidenceChecks = []
 } = {}) {
   const rules = String(reviewRules ?? '').trim();
   // The caller numbers its rules from 2; the tests item comes after them.
@@ -457,13 +460,15 @@ export function buildReviewPrompt({
     'its own line, using exactly one of:',
     '- `**Verdict: BLOCKED**` — a concrete correctness, security, guidance, or',
     '  contribution-contract problem must be fixed before merge.',
-    '- `**Verdict: NEEDS_EVIDENCE**` — no blocker, but a required artifact (a screenshot,',
-    '  a recording, a measurement, or a live-run statement) is missing, stale, or',
-    '  contradicted by the diff.',
+    '- `**Verdict: NEEDS_EVIDENCE**` — no blocker, but required evidence (a CI check on the',
+    '  head, a screenshot, a recording, or a measurement) is missing, stale, or contradicted',
+    '  by the diff.',
     '- `**Verdict: PASS**` — no blocker and no missing required artifact.',
     '',
     'Prefer BLOCKED whenever you can name a concrete defect. Never return PASS as bare',
     'prose: a PASS must state what you verified.',
+    '',
+    evidencePromptSection({ headSha, contextDir, evidenceChecks }),
     '',
     '## Findings cite file:line and a suggested fix',
     'Every finding names a file path and line (`path/to/file.ext:123`), states the concrete',
@@ -493,7 +498,7 @@ export function buildReviewPrompt({
     `PR: ${prNumber}`,
     `Head: ${headRef} @ ${headSha}`,
     `Base: ${baseRef}`,
-    `Context: \`${contextDir}/\` (pr.json, pr.patch, review-comments.json, linked/<n>.json)`,
+    `Context: \`${contextDir}/\` (pr.json, pr.patch, pr.diff, checks.json, review-comments.json, linked/<n>.json)`,
     '',
     `State the head you reviewed with a line reading exactly: Reviewed HEAD: \`${headSha}\``
   ].join('\n');

@@ -1,6 +1,6 @@
 # Kinsho, the gold general: an automated PR reviewer, as a reusable workflow.
 #
-#   uses: LABCAT/kinsho/.github/workflows/review.yml@v0.1.0
+#   uses: LABCAT/kinsho/.github/workflows/review.yml@v0.3.0
 #
 # Kinsho reviews a pull request and states a verdict up front: BLOCKED,
 # NEEDS_EVIDENCE, or PASS. Findings cite `file:line` with a suggested fix, and the
@@ -36,6 +36,12 @@
 # takes the defaults below (opencode-go/gpt-6-luna, high). The agent file pins no
 # model, so this is the single source of truth. A model or effort the backend does
 # not offer fails the run before anything is posted. The comment names both.
+#
+# Evidence: author statements ("verified", "works", "tested locally") never count.
+# Only check runs CI recorded on the PR's head SHA do; the reviewer reads them from
+# checks.json. With `evidence_checks` set, a runtime change (anything but docs,
+# tests or comments) can only PASS when each named check is green on the head:
+# the post step turns any other PASS into NEEDS_EVIDENCE, whatever the model said.
 #
 # Humans are the only merge authority: this workflow never approves, merges, or
 # pushes.
@@ -80,6 +86,16 @@ on:
         type: string
         required: false
         default: ''
+      evidence_checks:
+        description: Check-run names that count as runtime evidence, one per line. When set, a runtime change can only PASS with each green on the head SHA.
+        type: string
+        required: false
+        default: ''
+      evidence_wait_minutes:
+        description: How long to wait for evidence_checks to finish before reviewing. Checks still running after that count as missing.
+        type: number
+        required: false
+        default: 20
       routing_marker:
         description: HTML comment added to fix-requesting reviews of routed PRs, for an implementer bot. Empty turns routing off.
         type: string
@@ -195,6 +211,18 @@ jobs:
           permission-contents: read
           permission-issues: write
           permission-pull-requests: write
+
+      # Read-only, for check runs only. A separate token so an app that lacks the
+      # Checks permission still reviews: the evidence then reads as unavailable and
+      # a runtime change cannot PASS, instead of every run failing here.
+      - name: Generate Kinsho checks token
+        id: checks-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KINSHO_APP_ID }}
+          private-key: ${{ secrets.KINSHO_APP_PRIVATE_KEY }}
+          permission-checks: read
 
       - name: Authorise manual review command
         id: access
@@ -350,6 +378,10 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REVIEW_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           CONTEXT_DIR: .review-context
+          CHECKS_TOKEN: ${{ steps.checks-token.outputs.token }}
+          EVIDENCE_CHECKS: ${{ inputs.evidence_checks }}
+          EVIDENCE_WAIT_MINUTES: ${{ inputs.evidence_wait_minutes }}
+          EVIDENCE_DIR: ${{ runner.temp }}/kinsho-evidence
         run: |
           set -euo pipefail
           context="$CONTEXT_DIR"
@@ -368,6 +400,44 @@ jobs:
           fi
 
           gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --patch > "$context/pr.patch"
+          # The combined diff, which the evidence gate classifies file by file.
+          gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > "$context/pr.diff"
+
+          # Check runs on the reviewed head: the only evidence that counts. This
+          # run's own job is left out. Waits for the caller's evidence checks.
+          fetch_checks() {
+            if [ -z "$CHECKS_TOKEN" ]; then
+              jq -n --arg head "$REVIEW_HEAD_SHA" '{head: $head, error: "no checks token (the Kinsho app needs Checks: read)", check_runs: []}'
+              return
+            fi
+            local runs
+            if runs="$(GH_TOKEN="$CHECKS_TOKEN" gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/commits/${REVIEW_HEAD_SHA}/check-runs?per_page=100" --jq '.check_runs[]')"; then
+              printf '%s' "$runs" | jq -s --arg head "$REVIEW_HEAD_SHA" --arg own "/actions/runs/${GITHUB_RUN_ID}/" '{
+                head: $head, error: null,
+                check_runs: [ .[] | select((.details_url // "") | contains($own) | not)
+                  | {id, name, status, conclusion, app: .app.slug, started_at, completed_at, details_url} ]
+              }'
+            else
+              jq -n --arg head "$REVIEW_HEAD_SHA" '{head: $head, error: "could not list check runs", check_runs: []}'
+            fi
+          }
+          deadline=$((SECONDS + ${EVIDENCE_WAIT_MINUTES:-20} * 60))
+          while : ; do
+            fetch_checks > "$context/checks.json"
+            pending="$(CHECKS_FILE="$context/checks.json" node .kinsho/.github/scripts/review-cli.mjs evidencePending)"
+            if [ -z "$pending" ]; then break; fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::notice::Evidence checks still unfinished; reviewing without them: $(echo $pending)"
+              break
+            fi
+            echo "Waiting for evidence checks: $(echo $pending)"
+            sleep 30
+          done
+
+          # The gate reads its own copy, outside anything the model can touch.
+          mkdir -p "$EVIDENCE_DIR"
+          cp "$context/pr.diff" "$context/checks.json" "$EVIDENCE_DIR/"
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" --paginate \
             | jq -s 'add // []' > "$context/review-comments.json"
 
@@ -421,6 +491,7 @@ jobs:
           REVIEW_RULES: ${{ inputs.review_rules }}
           TEST_COMMAND: ${{ inputs.test_command }}
           CHECK_COMMAND: ${{ inputs.check_command }}
+          EVIDENCE_CHECKS: ${{ inputs.evidence_checks }}
         run: |
           echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
           node .kinsho/.github/scripts/review-cli.mjs prompt
@@ -523,6 +594,9 @@ jobs:
           ROUTING_MARKER: ${{ inputs.routing_marker }}
           REVIEW_MODEL: ${{ steps.model.outputs.model }}
           REVIEW_EFFORT: ${{ steps.model.outputs.effort }}
+          EVIDENCE_CHECKS: ${{ inputs.evidence_checks }}
+          DIFF_FILE: ${{ runner.temp }}/kinsho-evidence/pr.diff
+          CHECKS_FILE: ${{ runner.temp }}/kinsho-evidence/checks.json
           MESSAGE_FILE: ${{ runner.temp }}/review-message.md
           COMMENT_FILE: ${{ runner.temp }}/review-comment.md
         run: |
@@ -549,7 +623,8 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          VERDICT: ${{ steps.run.outputs.verdict }}
+          # The posted verdict, after the evidence gate, not the model's.
+          VERDICT: ${{ steps.post.outputs.verdict }}
         run: |
           set -euo pipefail
           current_head="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')"
@@ -607,7 +682,7 @@ jobs:
         if: always() && steps.access.outputs.allowed == 'true'
         env:
           KIND: ${{ steps.run.outputs.kind }}
-          VERDICT: ${{ steps.run.outputs.verdict }}
+          VERDICT: ${{ steps.post.outputs.verdict || steps.run.outputs.verdict }}
           ATTEMPTS: ${{ steps.run.outputs.attempts }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           REVIEW_MODEL: ${{ steps.model.outputs.model }}
