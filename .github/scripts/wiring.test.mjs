@@ -127,6 +127,13 @@ test('commands run only after the sandbox is prepared, and their text is fixed b
   assert.match(WORKFLOW, /inputs\.run_commands && \(inputs\.test_command != '' \|\| inputs\.check_command != ''\)/);
 });
 
+test('the prompt is built after the sandbox, so it tells the model whether commands can run', () => {
+  const prompt = WORKFLOW.indexOf('- name: Build review prompt');
+  assert.ok(prompt > WORKFLOW.indexOf('- name: Prepare command sandbox'));
+  assert.ok(prompt < WORKFLOW.indexOf('- name: Run Kinsho review'));
+  assert.match(WORKFLOW, /COMMANDS_ENABLED: \$\{\{ steps\.sandbox\.outcome == 'success' \}\}/);
+});
+
 test('run_commands is a boolean input that defaults on', () => {
   assert.match(WORKFLOW, /^ {6}run_commands:\n(?: {8}.+\n)*? {8}type: boolean\n {8}required: false\n {8}default: true$/m);
 });

@@ -419,26 +419,6 @@ jobs:
 
           find "$context" -type f | sort
 
-      - name: Build review prompt
-        id: prompt
-        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
-        env:
-          PROMPT_FILE: ${{ runner.temp }}/review-prompt.md
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          BASE_REF: ${{ steps.pr.outputs.base_ref }}
-          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
-          TASK_REF: ${{ steps.pr.outputs.url }}
-          PROJECT_CONTEXT: ${{ inputs.project_context }}
-          REVIEW_RULES: ${{ inputs.review_rules }}
-          TEST_COMMAND: ${{ inputs.test_command }}
-          CHECK_COMMAND: ${{ inputs.check_command }}
-          COMMANDS_ENABLED: ${{ steps.sandbox.outcome == 'success' }}
-        run: |
-          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
-          node .kinsho/.github/scripts/review-cli.mjs prompt
-
       # The model step's only credential. Read-only, and scoped to this repository
       # (the action's default), so nothing the model does can write to GitHub.
       - name: Generate Kinsho read-only token
@@ -492,6 +472,26 @@ jobs:
             echo "user=$user"
             echo "dir=$dir"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Build review prompt
+        id: prompt
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
+        env:
+          PROMPT_FILE: ${{ runner.temp }}/review-prompt.md
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          TASK_REF: ${{ steps.pr.outputs.url }}
+          PROJECT_CONTEXT: ${{ inputs.project_context }}
+          REVIEW_RULES: ${{ inputs.review_rules }}
+          TEST_COMMAND: ${{ inputs.test_command }}
+          CHECK_COMMAND: ${{ inputs.check_command }}
+          COMMANDS_ENABLED: ${{ steps.sandbox.outcome == 'success' }}
+        run: |
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+          node .kinsho/.github/scripts/review-cli.mjs prompt
 
       - name: Install opencode
         if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
