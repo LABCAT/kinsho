@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   review:
-    uses: LABCAT/kinsho/.github/workflows/review.yml@v0.1.0
+    uses: LABCAT/kinsho/.github/workflows/review.yml@v0.3.0
     with:
       test_command: npm test
       check_command: npm run lint

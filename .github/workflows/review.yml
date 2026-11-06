@@ -1,6 +1,6 @@
 # Kinsho, the gold general: an automated PR reviewer, as a reusable workflow.
 #
-#   uses: LABCAT/kinsho/.github/workflows/review.yml@v0.1.0
+#   uses: LABCAT/kinsho/.github/workflows/review.yml@v0.3.0
 #
 # Kinsho reviews a pull request and states a verdict up front: BLOCKED,
 # NEEDS_EVIDENCE, or PASS. Findings cite `file:line` with a suggested fix, and the
