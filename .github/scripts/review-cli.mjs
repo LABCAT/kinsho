@@ -30,6 +30,7 @@ import {
   checkModelSettings,
   resolveModelSettings,
   safetyBlockedBody,
+  summariseToolCalls,
   validateReview
 } from './review-verdict.mjs';
 import { findLeak } from './tool-policy.mjs';
@@ -87,6 +88,12 @@ const commands = {
     if (result.kind === 'review') writeFileSync(process.env.MESSAGE_FILE, result.message);
     output({ kind: result.kind, verdict: result.verdict ?? '' });
     console.log(`classify: ${result.kind}${result.verdict ? ` verdict=${result.verdict}` : ''}`);
+  },
+
+  // Print the model's tool calls so the run log shows what it ran, fetched or was denied.
+  toolLog() {
+    const lines = summariseToolCalls(readFileSync(process.env.RAW_FILE, 'utf8'));
+    console.log(lines.length ? lines.join('\n') : 'The model made no tool calls.');
   },
 
   backoff() {

@@ -590,6 +590,12 @@ jobs:
             echo "raw=$last_raw"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Show tool calls
+        if: always() && steps.run.outputs.raw != ''
+        env:
+          RAW_FILE: ${{ steps.run.outputs.raw }}
+        run: node .kinsho/.github/scripts/review-cli.mjs toolLog
+
       - name: Post review comment
         id: post
         if: steps.access.outputs.allowed == 'true' && steps.run.outputs.kind == 'review'

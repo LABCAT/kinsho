@@ -333,6 +333,20 @@ export function parseRunOutput(stdout) {
   return { events, message, errors };
 }
 
+// One line per tool call the model made, for the run log: tool, what it was asked
+// to do, how it ended, and the first part of the result. A denied call shows here.
+export function summariseToolCalls(stdout) {
+  return parseRunOutput(stdout)
+    .events.filter((event) => event?.type === 'tool_use' && event.part)
+    .map((event) => {
+      const state = event.part.state ?? {};
+      const input = state.input ?? {};
+      const what = input.command ?? input.url ?? input.filePath ?? input.pattern ?? JSON.stringify(input);
+      const result = String(state.output ?? state.error ?? '').replace(/\s+/g, ' ').slice(0, 200);
+      return `${event.part.tool} [${state.status ?? 'unknown'}] ${what} -> ${result}`;
+    });
+}
+
 export function extractReviewText(stdout) {
   return parseRunOutput(stdout).message;
 }
