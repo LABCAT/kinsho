@@ -37,6 +37,13 @@
 # model, so this is the single source of truth. A model or effort the backend does
 # not offer fails the run before anything is posted. The comment names both.
 #
+# Tools: the review model reads files, makes read-only GitHub calls through
+# `kinsho-gh.mjs`, fetches official documentation, and (when `run_commands` is on
+# and the caller named a command) runs the caller's test/check command through
+# `kinsho-exec.mjs`. It has no general shell, no write tools, and the only token in
+# its environment is a read-only one. Its comment and labels are written by later
+# steps with a separate write token. The commands run PR code, so they run as
+# another user with an empty environment (see "Prepare command sandbox").
 # Evidence: author statements ("verified", "works", "tested locally") never count.
 # Only check runs CI recorded on the PR's head SHA do; the reviewer reads them from
 # checks.json. With `evidence_checks` set, a runtime change (anything but docs,
@@ -61,13 +68,18 @@ on:
         type: string
         required: false
         default: high
+      run_commands:
+        description: Let the reviewer run test_command and check_command (in a sandbox, on the PR head). Set false when they are slow or need setup the sandbox lacks.
+        type: boolean
+        required: false
+        default: true
       test_command:
-        description: The repository's test command, named in the review checklist. Kinsho never runs it.
+        description: The repository's test command, named in the review checklist. Include any install it needs. Run only when run_commands is true.
         type: string
         required: false
         default: ''
       check_command:
-        description: The repository's lint/check/build command, named in the review checklist. Kinsho never runs it.
+        description: The repository's lint/check/build command, named in the review checklist. Include any install it needs. Run only when run_commands is true.
         type: string
         required: false
         default: ''
@@ -485,6 +497,60 @@ jobs:
 
           find "$context" -type f | sort
 
+      # The model step's only credential. Read-only, and scoped to this repository
+      # (the action's default), so nothing the model does can write to GitHub.
+      - name: Generate Kinsho read-only token
+        id: read-token
+        if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KINSHO_APP_ID }}
+          private-key: ${{ secrets.KINSHO_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: read
+          permission-checks: read
+          permission-actions: read
+
+      # The test/check commands run the PR's own code, so that code gets no secret:
+      # it runs as a different user (which cannot read the model process's
+      # environment), with an empty environment, from a checkout that has no
+      # credentials. The command text is written here, before the model starts; the
+      # model can only pick `test` or `check`.
+      - name: Check out PR head for commands
+        id: sandbox-checkout
+        if: >-
+          steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true' &&
+          inputs.run_commands && (inputs.test_command != '' || inputs.check_command != '')
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          path: .pr-head
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare command sandbox
+        id: sandbox
+        if: steps.sandbox-checkout.outcome == 'success'
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          CHECK_COMMAND: ${{ inputs.check_command }}
+        run: |
+          set -euo pipefail
+          user=kinsho-sbx
+          sudo useradd --create-home --shell /bin/bash "$user"
+          sudo mv "$GITHUB_WORKSPACE/.pr-head" "/home/$user/pr"
+          sudo chown -R "$user:$user" "/home/$user/pr"
+          dir="$RUNNER_TEMP/kinsho-commands"
+          mkdir -p "$dir"
+          printf '%s' "$TEST_COMMAND" > "$dir/test"
+          printf '%s' "$CHECK_COMMAND" > "$dir/check"
+          chmod -R a+rX "$dir"
+          {
+            echo "user=$user"
+            echo "dir=$dir"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build review prompt
         id: prompt
         if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
@@ -500,6 +566,7 @@ jobs:
           REVIEW_RULES: ${{ inputs.review_rules }}
           TEST_COMMAND: ${{ inputs.test_command }}
           CHECK_COMMAND: ${{ inputs.check_command }}
+          COMMANDS_ENABLED: ${{ steps.sandbox.outcome == 'success' }}
           EVIDENCE_CHECKS: ${{ inputs.evidence_checks }}
         run: |
           echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
@@ -508,10 +575,18 @@ jobs:
       - name: Install opencode
         if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
         run: |
-          mkdir -p .opencode/agent
+          mkdir -p .opencode/agent .opencode/plugins
           cp .kinsho/.opencode/agent/kinsho-review.md .opencode/agent/kinsho-review.md
+          cp .kinsho/.opencode/plugins/kinsho-guard.js .opencode/plugins/kinsho-guard.js
           npm install -g opencode-ai@1.18.34
           opencode --version
+          # opencode's own bash rule lets `>` and `<` through after an allowed
+          # script, so the guard plugin is what stops them. Without it loaded, stop;
+          # and make the trusted checkout read-only so a redirect cannot edit the
+          # scripts later steps run.
+          opencode debug config | grep -q 'plugins/kinsho-guard\.js' \
+            || { echo "::error::The Kinsho guard plugin is not loaded; refusing to run the model."; exit 1; }
+          chmod -R a-w .kinsho
 
       # Runs after install so the model list comes from the same CLI that runs the
       # review. The list is fetched with the key set, as the review run sees it.
@@ -537,6 +612,9 @@ jobs:
         if: steps.access.outputs.allowed == 'true' && steps.safety.outputs.blocked != 'true'
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          KINSHO_COMMAND_DIR: ${{ steps.sandbox.outputs.dir }}
+          KINSHO_SANDBOX_USER: ${{ steps.sandbox.outputs.user }}
           KINSHO_MODEL: ${{ steps.model.outputs.model }}
           KINSHO_EFFORT: ${{ steps.model.outputs.effort }}
           REVIEW_TIMEOUT: 30m
@@ -591,6 +669,12 @@ jobs:
             echo "raw=$last_raw"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Show tool calls
+        if: always() && steps.run.outputs.raw != ''
+        env:
+          RAW_FILE: ${{ steps.run.outputs.raw }}
+        run: node .kinsho/.github/scripts/review-cli.mjs toolLog
+
       - name: Post review comment
         id: post
         if: steps.access.outputs.allowed == 'true' && steps.run.outputs.kind == 'review'
@@ -603,6 +687,10 @@ jobs:
           ROUTING_MARKER: ${{ inputs.routing_marker }}
           REVIEW_MODEL: ${{ steps.model.outputs.model }}
           REVIEW_EFFORT: ${{ steps.model.outputs.effort }}
+          # Values the comment must not contain; see `assertNoLeak`.
+          LEAK_OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          LEAK_READ_TOKEN: ${{ steps.read-token.outputs.token }}
+          LEAK_WRITE_TOKEN: ${{ steps.app-token.outputs.token }}
           EVIDENCE_CHECKS: ${{ inputs.evidence_checks }}
           DIFF_FILE: ${{ runner.temp }}/kinsho-evidence/pr.diff
           CHECKS_FILE: ${{ runner.temp }}/kinsho-evidence/checks.json
@@ -673,6 +761,9 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ATTEMPTS: ${{ steps.run.outputs.attempts }}
           ERROR_FILE: ${{ steps.run.outputs.raw }}
+          LEAK_OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          LEAK_READ_TOKEN: ${{ steps.read-token.outputs.token }}
+          LEAK_WRITE_TOKEN: ${{ steps.app-token.outputs.token }}
           COMMENT_FILE: ${{ runner.temp }}/review-failure.md
         run: |
           set -euo pipefail

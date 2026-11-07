@@ -33,8 +33,10 @@ import {
   checkModelSettings,
   resolveModelSettings,
   safetyBlockedBody,
+  summariseToolCalls,
   validateReview
 } from './review-verdict.mjs';
+import { findLeak } from './tool-policy.mjs';
 
 const [, , command] = process.argv;
 
@@ -60,6 +62,16 @@ function fail(message) {
   process.exit(1);
 }
 
+// A comment is public. Refuse to post one that contains a credential, whatever
+// put it there (a planted instruction, a log line, a tool's output).
+function assertNoLeak(body) {
+  const secrets = Object.entries(process.env)
+    .filter(([name]) => name.startsWith('LEAK_'))
+    .map(([, value]) => value);
+  const leak = findLeak(body, secrets);
+  if (leak) fail(`The comment contains ${leak}; refusing to post it.`);
+}
+
 const commands = {
   prompt() {
     const prompt = buildReviewPrompt({
@@ -74,6 +86,7 @@ const commands = {
       reviewRules: process.env.REVIEW_RULES || '',
       testCommand: process.env.TEST_COMMAND || '',
       checkCommand: process.env.CHECK_COMMAND || '',
+      commandsEnabled: process.env.COMMANDS_ENABLED === 'true',
       evidenceChecks: parseEvidenceChecks(process.env.EVIDENCE_CHECKS)
     });
     writeFileSync(process.env.PROMPT_FILE, prompt);
@@ -89,6 +102,12 @@ const commands = {
     if (result.kind === 'review') writeFileSync(process.env.MESSAGE_FILE, result.message);
     output({ kind: result.kind, verdict: result.verdict ?? '' });
     console.log(`classify: ${result.kind}${result.verdict ? ` verdict=${result.verdict}` : ''}`);
+  },
+
+  // Print the model's tool calls so the run log shows what it ran, fetched or was denied.
+  toolLog() {
+    const lines = summariseToolCalls(readFileSync(process.env.RAW_FILE, 'utf8'));
+    console.log(lines.length ? lines.join('\n') : 'The model made no tool calls.');
   },
 
   backoff() {
@@ -135,6 +154,7 @@ const commands = {
     const check = validateReview({ body, head });
     if (!check.ok) fail(`Composed review failed validation: ${check.reason}`);
 
+    assertNoLeak(body);
     writeFileSync(process.env.COMMENT_FILE, body);
     output({ verdict });
     console.log(`comment: verdict=${verdict} -> ${process.env.COMMENT_FILE}`);
@@ -151,6 +171,7 @@ const commands = {
       attempts: Number(process.env.ATTEMPTS || 0),
       error
     });
+    assertNoLeak(body);
     writeFileSync(process.env.COMMENT_FILE, body);
     console.log(`failure comment -> ${process.env.COMMENT_FILE}`);
   },

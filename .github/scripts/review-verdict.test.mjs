@@ -40,6 +40,7 @@ import {
   resolveModelSettings,
   reviewerOwnedChanges,
   safetyBlockedBody,
+  summariseToolCalls,
   validateReview,
   verdictLabel,
   errorSummary
@@ -649,6 +650,21 @@ test('the requested model and effort are logged before the secrets check can fai
 test('the README caller snippet passes both repository variables', () => {
   assert.ok(README.includes('model: ${{ vars.KINSHO_MODEL }}'));
   assert.ok(README.includes('effort: ${{ vars.KINSHO_EFFORT }}'));
+});
+
+test('summariseToolCalls lists each tool call with its status, so a denial shows in the log', () => {
+  const stdout = [
+    { type: 'tool_use', part: { tool: 'bash', state: { status: 'completed', input: { command: 'node .kinsho/.github/scripts/kinsho-gh.mjs api repos/o/r' }, output: '{"id": 1}' } } },
+    { type: 'tool_use', part: { tool: 'bash', state: { status: 'error', input: { command: 'git push' }, error: 'Kinsho denied this command' } } },
+    { type: 'tool_use', part: { tool: 'webfetch', state: { status: 'completed', input: { url: 'https://docs.github.com/' }, output: 'docs' } } },
+    { type: 'text', part: { text: 'hi', messageID: 'm' } }
+  ].map((event) => JSON.stringify(event)).join('\n');
+  assert.deepEqual(summariseToolCalls(stdout), [
+    'bash [completed] node .kinsho/.github/scripts/kinsho-gh.mjs api repos/o/r -> {"id": 1}',
+    'bash [error] git push -> Kinsho denied this command',
+    'webfetch [completed] https://docs.github.com/ -> docs'
+  ]);
+  assert.deepEqual(summariseToolCalls(''), []);
 });
 
 test('a pull request that closed before the review starts is skipped, not reviewed', () => {
