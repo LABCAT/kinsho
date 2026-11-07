@@ -242,7 +242,16 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           EVENT_NAME: ${{ github.event_name }}
           COMMENTER: ${{ github.event.comment.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
+          # Marking a PR ready and merging it straight away starts a review of a
+          # PR that is already closed. Skip it; an API error falls through to review.
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.state' 2>/dev/null)" || state=open
+          if [ "$state" = "closed" ]; then
+            echo "::notice::PR #${PR_NUMBER} is already closed; nothing to review."
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$EVENT_NAME" = "pull_request" ]; then
             echo "allowed=true" >> "$GITHUB_OUTPUT"
             exit 0
