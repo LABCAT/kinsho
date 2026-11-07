@@ -650,3 +650,13 @@ test('the README caller snippet passes both repository variables', () => {
   assert.ok(README.includes('model: ${{ vars.KINSHO_MODEL }}'));
   assert.ok(README.includes('effort: ${{ vars.KINSHO_EFFORT }}'));
 });
+
+test('a pull request that closed before the review starts is skipped, not reviewed', () => {
+  // Marking a PR ready and merging it straight away starts a review of a merged PR.
+  const start = WORKFLOW.indexOf('- name: Authorise manual review command');
+  const step = WORKFLOW.slice(start, WORKFLOW.indexOf('- name:', start + 10));
+  assert.ok(start > 0);
+  assert.match(step, /pulls\/\$\{?PR_NUMBER\}?" --jq '\.state'/);
+  assert.ok(step.indexOf('.state') < step.indexOf('allowed=true'), 'state is read before the review is allowed');
+  assert.match(step, /allowed=false/);
+});
