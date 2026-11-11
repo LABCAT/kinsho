@@ -11,6 +11,7 @@
 //   missingLabels — list the review labels the repository lacks (name\tcolor\tdescription)
 //   requireSecrets — fail, naming them, when required secrets are unset
 //   evidencePending — print the evidence checks not yet finished on the head, one per line
+//   resolveLlm — the same for an OpenAI-compatible endpoint (llm_base_url); also writes the provider config
 //   resolveModel — settle KINSHO_MODEL / KINSHO_EFFORT (defaults) and check them against the CLI's model list
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
@@ -26,7 +27,6 @@ import {
   extractVerdict,
   labelTransitions,
   missingReviewLabels,
-  missingSecrets,
   reviewerOwnedChanges,
   parseModelCatalog,
   parseProtectedPaths,
@@ -37,6 +37,14 @@ import {
   validateReview
 } from './review-verdict.mjs';
 import { findLeak } from './tool-policy.mjs';
+import {
+  buildProviderConfig,
+  checkRemoteModel,
+  llmBaseUrl,
+  missingSecretsFor,
+  parseBaseUrl,
+  resolveLlmSettings
+} from './llm-provider.mjs';
 
 const [, , command] = process.argv;
 
@@ -143,6 +151,7 @@ const commands = {
       head,
       verdict,
       model: process.env.REVIEW_MODEL,
+      providerHost: process.env.REVIEW_PROVIDER_HOST || '',
       effort: process.env.REVIEW_EFFORT,
       runUrl: process.env.RUN_URL || '',
       // Only a verdict that asks for fixes is routed to the implementer; a PASS
@@ -237,11 +246,38 @@ const commands = {
     console.log(`model: ${settings.model} effort: ${settings.effort}`);
   },
 
+  // The OpenAI-compatible path (`llm_base_url` set): settle model and effort,
+  // check the model against the endpoint, and write the opencode provider config.
+  // The URL and key stay in the environment; only the host is ever printed.
+  async resolveLlm() {
+    const base = parseBaseUrl(process.env.KINSHO_LLM_BASE_URL);
+    if (!base.ok) fail(base.reason);
+    const settings = resolveLlmSettings({ model: process.env.MODEL_INPUT, effort: process.env.EFFORT_INPUT });
+    if (!settings.ok) fail(settings.reason);
+    const check = await checkRemoteModel({
+      baseUrl: base.href,
+      apiKey: process.env.LLM_API_KEY,
+      modelId: settings.id
+    });
+    if (!check.ok) fail(`${check.reason} Set the KINSHO_MODEL repository variable to a model that ${base.host} serves.`);
+    const configFile = process.env.CONFIG_FILE;
+    writeFileSync(configFile, JSON.stringify(buildProviderConfig({ modelId: settings.id }), null, 2));
+    output({
+      model: settings.id,
+      effort: settings.effort,
+      run_model: settings.runModel,
+      config: configFile,
+      provider_host: base.host
+    });
+    console.log(`model: ${settings.id} effort: ${settings.effort} provider: ${base.host}`);
+  },
+
   // Names only: a secret's value is never read beyond whether it is set.
   requireSecrets() {
-    const missing = missingSecrets(process.env);
+    const missing = missingSecretsFor(process.env);
     if (missing.length > 0) {
-      fail(`Kinsho secrets are unset: ${missing.join(', ')}. Pass them from the caller workflow before the reviewer can run.`);
+      const via = llmBaseUrl(process.env.LLM_BASE_URL) ? ' (llm_base_url is set, so LLM_API_KEY is required instead of OPENCODE_API_KEY)' : '';
+      fail(`Kinsho secrets are unset: ${missing.join(', ')}${via}. Pass them from the caller workflow before the reviewer can run.`);
     }
   }
 };

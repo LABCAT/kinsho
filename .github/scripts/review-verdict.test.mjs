@@ -627,7 +627,7 @@ test('the workflow declares model and effort inputs with the stated defaults', (
 
 test('the agent file pins no model, so the workflow input is the only source', () => {
   assert.ok(!/^model:/m.test(AGENT));
-  assert.match(WORKFLOW, /-m "\$KINSHO_MODEL" --variant "\$KINSHO_EFFORT"/);
+  assert.match(WORKFLOW, /-m "\${KINSHO_RUN_MODEL:-\$KINSHO_MODEL}" --variant "\$KINSHO_EFFORT"/);
 });
 
 test('the model is checked before the review runs and before anything is posted', () => {

@@ -99,10 +99,11 @@ export function isReviewLabel(label) {
   return ALL_REVIEW_LABELS.includes(label);
 }
 
-export function metaMarker({ head, verdict, model = '', effort = '' }) {
+export function metaMarker({ head, verdict, model = '', effort = '', providerHost = '' }) {
   const meta = { head, verdict: normalizeVerdict(verdict) };
   // Only a review a model produced names one; a safety block runs no model.
   if (model) Object.assign(meta, { model, effort });
+  if (model && providerHost) meta.provider = providerHost;
   return `${META_MARKER_PREFIX}${JSON.stringify(meta)} -->`;
 }
 
@@ -226,7 +227,7 @@ export function validateReview({ body, head }) {
 // Compose the single immutable comment: one header, the model's body, the
 // reviewed head, an optional implementer routing marker, the run link, and the
 // machine-readable verdict as the final line.
-export function composeReviewComment({ body, head, verdict, runUrl = '', route = false, routingMarker = '', model = '', effort = '' }) {
+export function composeReviewComment({ body, head, verdict, runUrl = '', route = false, routingMarker = '', model = '', effort = '', providerHost = '' }) {
   const value = normalizeVerdict(verdict);
   if (!value) throw new Error(`composeReviewComment: unsupported verdict ${verdict}`);
 
@@ -247,12 +248,12 @@ export function composeReviewComment({ body, head, verdict, runUrl = '', route =
     out.push(`**Verdict: ${displayVerdict(value)}**`, `Reviewed HEAD: \`${head}\``, '');
   }
   out.push(lines.join('\n'));
-  if (model) out.push('', `model: ${model} · effort: ${effort}`);
+  if (model) out.push('', `model: ${model} · effort: ${effort}${providerHost ? ` · provider: ${providerHost}` : ''}`);
   // The routing marker asks the implementer to pick up fixes, so it only ever
   // appears on a verdict that requests them — never on a PASS.
   if (route && routingMarker && value !== 'pass') out.push('', routingMarker);
   if (runUrl) out.push('', `[Review run](${runUrl})`);
-  out.push('', metaMarker({ head, verdict: value, model, effort }));
+  out.push('', metaMarker({ head, verdict: value, model, effort, providerHost }));
   return out.join('\n');
 }
 
