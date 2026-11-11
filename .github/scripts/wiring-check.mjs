@@ -7,7 +7,7 @@ export const ALLOWED_BASH = [
   'node .kinsho/.github/scripts/kinsho-exec.mjs test',
   'node .kinsho/.github/scripts/kinsho-exec.mjs check'
 ];
-export const ALLOWED_SECRETS = ['OPENCODE_API_KEY', 'KINSHO_APP_ID', 'KINSHO_APP_PRIVATE_KEY'];
+export const ALLOWED_SECRETS = ['OPENCODE_API_KEY', 'LLM_API_KEY', 'KINSHO_APP_ID', 'KINSHO_APP_PRIVATE_KEY'];
 export const FORBIDDEN_SECRET = /CLOUDFLARE|NEON|DATABASE|PROD/i;
 const TOOL_ALLOWED = ['read', 'grep', 'glob', 'list', 'webfetch', 'bash'];
 
@@ -99,7 +99,7 @@ export function workflowViolations(text) {
     if (!token.includes('steps.read-token.outputs.token')) out.push('the model step GH_TOKEN must be the read-only token');
     if (/app-token/.test(run.body)) out.push('the model step must not see the write token');
     for (const [, name] of run.body.matchAll(/secrets\.([A-Za-z0-9_]+)/g)) {
-      if (name !== 'OPENCODE_API_KEY') out.push(`the model step must not see secret ${name}`);
+      if (name !== 'OPENCODE_API_KEY' && name !== 'LLM_API_KEY') out.push(`the model step must not see secret ${name}`);
     }
   }
   const read = steps.find((step) => step.id === 'read-token');

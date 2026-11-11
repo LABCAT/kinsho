@@ -50,7 +50,7 @@ gh variable set KINSHO_MODEL --body opencode-go/gpt-6-luna
 gh variable set KINSHO_EFFORT --body high
 ```
 
-Both are optional. Unset (or empty), the review runs `opencode-go/gpt-6-luna` at `high`. GitHub resolves `vars` from the calling repo, so each project sets its own. A model or effort the backend doesn't offer fails the run with a message and posts nothing, so it can never count as a `PASS` or set `pr-ready`. The run log and the review comment state the model and effort used.
+Both are optional. Unset (or empty), the review runs `opencode-go/gpt-6-luna` at `high` (with `llm_base_url` set there is no default model, so `KINSHO_MODEL` must be set). GitHub resolves `vars` from the calling repo, so each project sets its own. A model or effort the backend doesn't offer fails the run with a message and posts nothing, so it can never count as a `PASS` or set `pr-ready`. The run log and the review comment state the model and effort used.
 
 If you name the file something else, add it to `protected_paths`, so a PR can't weaken its own reviewer.
 
@@ -62,6 +62,7 @@ All optional.
 |-------|---------|---------|
 | `model` | `opencode-go/gpt-6-luna` | Model the review runs on; pass `vars.KINSHO_MODEL` |
 | `effort` | `high` | Reasoning effort (the model's variant); pass `vars.KINSHO_EFFORT` |
+| `llm_base_url` | none | OpenAI-compatible endpoint, for example `https://api.deeprelay.ai/v1`. When set, `model` is that endpoint's model id and `LLM_API_KEY` is used; see [Bring your own endpoint](#bring-your-own-endpoint) |
 | `run_commands` | `true` | Let the reviewer run `test_command` and `check_command` in a sandbox; `false` skips them |
 | `test_command` | none | Test command, named in the checklist and run when `run_commands` is on. Include any install it needs |
 | `check_command` | none | Lint/check/build command, same rules as `test_command` |
@@ -74,17 +75,78 @@ All optional.
 | `route_branch_prefix` | none | Route PRs from branches with this prefix |
 | `route_body_marker` | none | Route PRs whose body contains this text |
 
+## Bring your own endpoint
+
+By default Kinsho runs on an OpenCode Go plan. Without one, point it at any OpenAI-compatible endpoint with `llm_base_url`. Kinsho then configures opencode with a custom provider (`@ai-sdk/openai-compatible`), reads the key from the `LLM_API_KEY` secret, and runs the model named in `model` against it. `OPENCODE_API_KEY` is not needed, and unset `llm_base_url` behaves exactly as before.
+
+With `llm_base_url` set, `model` is the id the endpoint serves, not `provider/model`. The `opencode-go` default does not apply, so `model` must be set. The endpoint is checked first: its `/models` list must contain the model and accept the key, otherwise the run fails with a message and posts nothing. An endpoint with no `/models` route is not pre-checked, and a wrong id then fails the run itself. Either way a bad model is never a `PASS`. The URL must be `https`, and it must not carry credentials.
+
+Example with DeepRelay:
+
+```yaml
+jobs:
+  review:
+    uses: LABCAT/kinsho/.github/workflows/review.yml@v0.3.0
+    with:
+      llm_base_url: https://api.deeprelay.ai/v1
+      model: ${{ vars.KINSHO_MODEL }}   # a model id from https://api.deeprelay.ai/v1/models
+      effort: ${{ vars.KINSHO_EFFORT }}
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      KINSHO_APP_ID: ${{ secrets.KINSHO_APP_ID }}
+      KINSHO_APP_PRIVATE_KEY: ${{ secrets.KINSHO_APP_PRIVATE_KEY }}
+```
+
+Any other OpenAI-compatible service works the same way, whether a hosted provider, a gateway or a self-hosted server such as vLLM. Give its `/v1` base URL, the model id it lists, and a key:
+
+```yaml
+    with:
+      llm_base_url: https://llm.example.com/v1
+      model: my-review-model
+      effort: high
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      KINSHO_APP_ID: ${{ secrets.KINSHO_APP_ID }}
+      KINSHO_APP_PRIVATE_KEY: ${{ secrets.KINSHO_APP_PRIVATE_KEY }}
+```
+
+`effort` is sent as the request's `reasoningEffort` and accepts `low`, `medium`, `high`, `xhigh` or `max`, so use a level your model understands. The key and URL are passed to opencode through the environment and never written to the config or the logs. The run log and the review comment state the model, the effort and the provider host (the host only).
+
 ## Secrets
 
-All required. The run fails and names any that are unset.
+`KINSHO_APP_ID` and `KINSHO_APP_PRIVATE_KEY` are always required. The model key depends on the backend. The run fails and names any required secret that is unset.
 
-| Secret | Purpose |
-|--------|---------|
-| `OPENCODE_API_KEY` | API key for the review model |
-| `KINSHO_APP_ID` | ID of the GitHub App the review posts as |
-| `KINSHO_APP_PRIVATE_KEY` | Private key of that app |
+| Secret | Required | Purpose |
+|--------|----------|---------|
+| `OPENCODE_API_KEY` | when `llm_base_url` is unset | API key for the review model on OpenCode Go |
+| `LLM_API_KEY` | when `llm_base_url` is set | API key for the OpenAI-compatible endpoint |
+| `KINSHO_APP_ID` | always | ID of the GitHub App the review posts as |
+| `KINSHO_APP_PRIVATE_KEY` | always | Private key of that app |
 
-The app needs write access to issues and pull requests, and read access to contents, actions and checks, and must be installed on your repo. The model step gets a separate token with read access only; the comment and labels are written by later steps with the write token. Without checks access the review still runs, but CI evidence reads as unavailable (see [Evidence](#evidence)).
+The app needs write access to issues and pull requests, and read access to contents, actions and checks, and must be installed on your repo. The model step gets a separate token with read access only; the comment and labels are written by later steps with the write token. Without checks access the review still runs, but CI evidence reads as unavailable (see [Evidence](#evidence)). To make the app, see below.
+
+## Create your GitHub App
+
+Kinsho posts its comment and labels as a GitHub App, so create one:
+
+1. Go to **Settings → Developer settings → GitHub Apps → New GitHub App** (on your account or organization).
+2. Give it a name such as `kinsho-<your-org>`, any homepage URL, and untick **Webhook → Active**. It needs no webhook.
+3. Under **Repository permissions** set:
+   - **Contents**: Read-only
+   - **Issues**: Read and write
+   - **Pull requests**: Read and write
+   - Optionally **Actions** and **Checks**: Read-only, so CI evidence can be read (see [Evidence](#evidence)). **Metadata** read is added automatically.
+4. Choose **Only on this account**, then **Create GitHub App**.
+5. On the app page, note the **App ID**, then under **Private keys** click **Generate a private key** and keep the downloaded `.pem`.
+6. Choose **Install App** and install it on the repository (or repositories) that run Kinsho.
+7. In each repository, under **Settings → Secrets and variables → Actions**, add the secrets:
+
+```bash
+gh secret set KINSHO_APP_ID --body "<the App ID>"
+gh secret set KINSHO_APP_PRIVATE_KEY < path/to/the-key.pem
+```
+
+Delete the local `.pem` afterwards. Never commit it or paste it into an issue or a log.
 
 ## Tools
 
@@ -139,7 +201,7 @@ updates:
       interval: weekly
 ```
 
-A bump PR edits the caller workflow. With the file named `.github/workflows/opencode-review.yml`, Kinsho blocks it for human review without a model run. GitHub doesn't give Dependabot PRs your Actions secrets, so unless you also add the three secrets as Dependabot secrets, a bump PR's review fails on the missing-secrets error. A person reviews and merges the bump either way.
+A bump PR edits the caller workflow. With the file named `.github/workflows/opencode-review.yml`, Kinsho blocks it for human review without a model run. GitHub doesn't give Dependabot PRs your Actions secrets, so unless you also add the required secrets as Dependabot secrets, a bump PR's review fails on the missing-secrets error. A person reviews and merges the bump either way.
 
 ## Development
 
